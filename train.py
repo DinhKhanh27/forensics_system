@@ -20,10 +20,29 @@ from pathlib import Path
 from typing import Dict, Tuple
 import numpy as np
 import torch
-from torch.cuda.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import yaml
+
+# Compatible AMP GradScaler and autocast (PyTorch 2.x+ clean support)
+try:
+    from torch.amp import GradScaler as _TorchAmpGradScaler
+    from torch.amp import autocast as _torch_autocast
+
+    def create_grad_scaler(device_type: str, enabled: bool):
+        return _TorchAmpGradScaler(device_type, enabled=enabled)
+
+    def get_autocast(device_type: str, enabled: bool):
+        return _torch_autocast(device_type, enabled=enabled)
+except (ImportError, TypeError):
+    from torch.cuda.amp import GradScaler as _TorchCudaGradScaler
+    from torch.cuda.amp import autocast as _torch_autocast
+
+    def create_grad_scaler(device_type: str, enabled: bool):
+        return _TorchCudaGradScaler(enabled=enabled)
+
+    def get_autocast(device_type: str, enabled: bool):
+        return _torch_autocast(enabled=enabled)
 
 from src.dataset import build_dataloaders
 from src.model import DWTMobileUNet, MultiTaskForensicLoss, count_parameters
@@ -113,7 +132,7 @@ def run_dry_run(
     criterion = MultiTaskForensicLoss(cls_weight=0.3, seg_weight=0.7)
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     amp_Active = bool(use_amp and device.type == "cuda")
-    scaler = GradScaler(enabled=amp_Active)
+    scaler = create_grad_scaler(device.type, enabled=amp_Active)
 
     # Synthetic batch: (B, C, 192, 192)
     synth_x = torch.randn(batch_size, in_channels, 192, 192, device=device)
@@ -123,7 +142,7 @@ def run_dry_run(
     model.train()
     optimizer.zero_grad(set_to_none=True)
 
-    with autocast(enabled=amp_Active):
+    with get_autocast(device.type, enabled=amp_Active):
         pred_cls, pred_mask = model(synth_x)
         loss, loss_dict = criterion(pred_cls, pred_mask, synth_cls, synth_mask)
 
@@ -175,7 +194,7 @@ def train_one_epoch(
     loader: torch.utils.data.DataLoader,
     criterion: MultiTaskForensicLoss,
     optimizer: torch.optim.Optimizer,
-    scaler: GradScaler,
+    scaler: object,
     device: torch.device,
     amp_enabled: bool,
 ) -> Dict[str, float]:
@@ -197,7 +216,7 @@ def train_one_epoch(
         mask_y = mask_y.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        with autocast(enabled=amp_enabled):
+        with get_autocast(device.type, enabled=amp_enabled):
             pred_cls, pred_mask = model(mra_x)
             loss, loss_dict = criterion(pred_cls, pred_mask, cls_y, mask_y)
 
@@ -239,7 +258,7 @@ def evaluate(
         cls_y = cls_y.to(device, non_blocking=True)
         mask_y = mask_y.to(device, non_blocking=True)
 
-        with autocast(enabled=amp_enabled):
+        with get_autocast(device.type, enabled=amp_enabled):
             pred_cls, pred_mask = model(mra_x)
             _, loss_dict = criterion(pred_cls, pred_mask, cls_y, mask_y)
 
@@ -420,7 +439,7 @@ def main() -> None:
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.01)
     amp_enabled = bool(use_amp and device.type == "cuda")
-    scaler = GradScaler(enabled=amp_enabled)
+    scaler = create_grad_scaler(device.type, enabled=amp_enabled)
 
     start_epoch = 1
     best_score = -1.0
