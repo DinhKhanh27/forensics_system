@@ -1,0 +1,33 @@
+# ==============================================================================
+# Git Ignore Configuration: DWT-MobileUNet
+# ==============================================================================
+
+# Byte-compiled / Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Datasets & Heavy Assets (store datasets locally or on Google Drive)
+data/*
+!data/.gitkeep
+
+# Checkpoints & Quantized Weights (store on Google Drive)
+checkpoints/*
+!checkpoints/.gitkeep
+
+# Logs & Temporary files
+logs/
+outputs/
+*.log
+.DS_Store
+Thumbs.db
+
+# Virtual Environments & IDE
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+*.swp
+*.swo

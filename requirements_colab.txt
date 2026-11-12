@@ -1,0 +1,17 @@
+# ==============================================================================
+# Google Colab & PC Development Dependencies (Training, Export & Gradio UI)
+# ==============================================================================
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.23.0
+opencv-python-headless>=4.7.0
+Pillow>=9.5.0
+PyYAML>=6.0
+tqdm>=4.65.0
+scikit-learn>=1.2.2
+albumentations>=1.3.0
+onnx>=1.14.0
+onnxruntime>=1.15.0
+gradio>=4.0.0
+matplotlib>=3.7.0
+psutil>=5.9.0

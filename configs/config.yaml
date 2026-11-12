@@ -1,0 +1,42 @@
+# ==============================================================================
+# CONFIGURATION: DWT-MobileUNet (Colab Training & Raspberry Pi 3 Deployment)
+# ==============================================================================
+
+project:
+  name: "DWT-MobileUNet-Forensics"
+  seed: 42
+
+data:
+  img_size: 192
+  use_forensic_maps: false          # false -> 9 channels (RGB + 6 DWT), true -> 11 channels (+ MAD + ELA)
+  ela_quality: 90                   # JPEG recompression quality for ELA (%)
+  num_workers: 2
+  train_split: 0.85
+
+model:
+  backbone: "mobilenet_v3_small"
+  width_multiplier: 0.5             # Keeps INT8 model size < 2 MB
+  in_channels: 9                    # Automatically becomes 11 if use_forensic_maps is true
+  dropout: 0.2
+  decoder_channels: [96, 48, 24, 16]
+
+loss:
+  cls_weight: 0.3                   # Weight for BCE classification loss (Head 1)
+  seg_weight: 0.7                   # Weight for (Dice + Focal) localization loss (Head 2)
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+
+training:
+  epochs: 50
+  batch_size: 16
+  lr: 0.001
+  weight_decay: 0.0001
+  amp: true                         # Automatic Mixed Precision (FP16) on Google Colab GPU
+  save_dir: "./checkpoints"
+
+inference:
+  mode: "auto"                      # Options: "fast", "tile", "auto"
+  auto_tile_threshold: 384          # Switch to sliding window if max(H, W) > 384
+  patch_size: 192
+  stride: 160                       # Divisible by 8 (preserves 8x8 JPEG block grid), overlap = 32 px
+  threshold: 0.5                    # Decision threshold T for mask binarization and P_fake
