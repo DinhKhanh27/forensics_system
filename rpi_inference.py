@@ -157,27 +157,32 @@ class EmbeddedForensicPredictor:
         """
         Runs 2-Level Haar DWT MRA + Model inference on a single 192x192 RGB patch.
         """
-        mra_tensor = self.mra(patch_rgb)  # (C, 192, 192)
-        batched = np.expand_dims(mra_tensor, axis=0)  # (1, C, 192, 192)
-
-        if self.session is not None:
-            ort_cls, ort_mask = self.session.run(None, {self.input_name: batched})
-            p_fake = float(np.squeeze(ort_cls))
-            mask_2d = np.squeeze(ort_mask).astype(np.float32)
-        elif self.torch_model is not None:
-            with torch.no_grad():
-                t_in = torch.from_numpy(batched)
-                pt_cls, pt_mask = self.torch_model(t_in)
-                p_fake = float(pt_cls.item())
-                mask_2d = pt_mask.squeeze().cpu().numpy().astype(np.float32)
+        if self.session is not None or self.torch_model is not None:
+            # Chuẩn hóa ảnh RGB về dạng float32 [0, 1] và đổi chiều thành (3, 192, 192)
+            img_float = patch_rgb.astype(np.float32) / 255.0
+            rgb_tensor = np.transpose(img_float, (2, 0, 1))  # (3, 192, 192)
+            batched = np.expand_dims(rgb_tensor, axis=0)      # (1, 3, 192, 192)
+            
+            if self.session is not None:
+                ort_cls, ort_mask = self.session.run(None, {self.input_name: batched})
+                p_fake = float(np.squeeze(ort_cls))
+                mask_2d = np.squeeze(ort_mask).astype(np.float32)
+            else:
+                with torch.no_grad():
+                    t_in = torch.from_numpy(batched)
+                    pt_cls, pt_mask = self.torch_model(t_in)
+                    p_fake = float(pt_cls.item())
+                    mask_2d = pt_mask.squeeze().cpu().numpy().astype(np.float32)
+            del rgb_tensor, batched
         else:
-            # Heuristic MRA fallback when running dry UI test before model export
+            # Heuristic MRA fallback when running dry UI test before model export (sử dụng mra_tensor)
+            mra_tensor = self.mra(patch_rgb)  # (C, 192, 192)
+            batched = np.expand_dims(mra_tensor, axis=0)  # (1, C, 192, 192)
             hf_energy = np.mean(np.abs(mra_tensor[3:9]), axis=0)
             norm_e = (hf_energy - hf_energy.min()) / (hf_energy.max() - hf_energy.min() + 1e-6)
             mask_2d = np.clip(norm_e, 0.0, 1.0).astype(np.float32)
             p_fake = float(np.percentile(mask_2d, 95))
-
-        del mra_tensor, batched
+            del mra_tensor, batched
         return p_fake, mask_2d
 
     def predict_image(

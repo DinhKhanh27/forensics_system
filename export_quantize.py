@@ -56,38 +56,18 @@ class SyntheticMRADataReader(CalibrationDataReader):
         return sample
 
 
-def load_or_init_pytorch_model(
-    checkpoint_path: Path, use_forensic_maps: bool = False
-) -> Tuple[DWTMobileUNet, int]:
-    """
-    Loads trained DWTMobileUNet weights from `checkpoint_path`. If the checkpoint does not
-    exist yet, initializes a clean model so the export pipeline can still be verified.
-    """
-    in_channels = 11 if use_forensic_maps else 9
-    width_multiplier = 0.5
-
-    if checkpoint_path.exists():
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
-        in_channels = ckpt.get("in_channels", in_channels)
-        width_multiplier = ckpt.get("width_multiplier", width_multiplier)
-        model = DWTMobileUNet(
-            in_channels=in_channels, width_multiplier=width_multiplier
-        )
-        state_dict = ckpt.get("model_state_dict", ckpt)
-        model.load_state_dict(state_dict, strict=True)
-        print(f"[EXPORT] Loaded trained weights from: {checkpoint_path}")
-    else:
-        print(
-            f"[EXPORT] Checkpoint '{checkpoint_path}' not found. Initializing fresh DWT-MobileUNet for export verification."
-        )
-        model = DWTMobileUNet(
-            in_channels=in_channels, width_multiplier=width_multiplier
-        )
-
+def load_or_init_pytorch_model(checkpoint_path, use_forensic_maps=False):
+    import torch
+    import sys
+    sys.path.append('/content/DATN_VER2')
+    from train import DWTMobileUNet
+    model = DWTMobileUNet()
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        print(f'[EXPORT] Loading weights from {checkpoint_path}...')
+        state_dict = torch.load(checkpoint_path, map_location='cpu')
+        model.load_state_dict(state_dict)
     model.eval()
-    return model, in_channels
-
-
+    return model, 3
 def export_to_onnx(
     model: DWTMobileUNet, in_channels: int, onnx_fp32_path: Path, opset: int = 13
 ) -> None:

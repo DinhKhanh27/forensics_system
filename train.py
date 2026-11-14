@@ -1,500 +1,320 @@
-"""
-Google Colab CUDA Training CLI for DWT-MobileUNet.
-
-Features:
-- Full CLI support: --data_dir, --save_dir, --config, --epochs, --batch_size, --lr,
-  --amp, --use-forensic-maps, --resume, and --dry-run.
-- Automatic CUDA GPU detection & Mixed Precision (torch.cuda.amp.autocast + GradScaler).
-- Mandatory --dry-run mode: Generates synthetic 9-channel (or 11-channel) MRA tensors,
-  executes 1 full Forward -> Multi-Task Loss -> Backward -> Optimizer step in < 3 seconds
-  to verify tensor shapes, parameter footprint (< 2 MB INT8), and CUDA compatibility.
-- Saves best_model.pth and last_model.pth directly to Google Drive (--save_dir).
-"""
-
-import argparse
-import json
 import os
-import random
-import time
-from pathlib import Path
-from typing import Dict, Tuple
+import sys
+import argparse
+import glob
 import numpy as np
 import torch
-from torch.cuda.amp import GradScaler, autocast
-from torch.optim import AdamW
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR
-import yaml
+from PIL import Image
+from pathlib import Path
 
-from src.dataset import build_dataloaders
-from src.model import DWTMobileUNet, MultiTaskForensicLoss, count_parameters
+# --- HELPER FUNCTIONS FOR DWT ---
+def haar_dwt_2d(x):
+    lvl1_LL = (x[:, :, 0::2, 0::2] + x[:, :, 0::2, 1::2] + x[:, :, 1::2, 0::2] + x[:, :, 1::2, 1::2]) / 2.0
+    lvl1_LH = (-x[:, :, 0::2, 0::2] + x[:, :, 0::2, 1::2] - x[:, :, 1::2, 0::2] + x[:, :, 1::2, 1::2]) / 2.0
+    lvl1_HL = (-x[:, :, 0::2, 0::2] - x[:, :, 0::2, 1::2] + x[:, :, 1::2, 0::2] + x[:, :, 1::2, 1::2]) / 2.0
+    lvl1_HH = (x[:, :, 0::2, 0::2] - x[:, :, 0::2, 1::2] - x[:, :, 1::2, 0::2] + x[:, :, 1::2, 1::2]) / 2.0
+    return torch.cat([lvl1_LL, lvl1_LH, lvl1_HL, lvl1_HH], dim=1)
 
+# --- DATASET & DATA LOADER ---
+class CASIADataset(Dataset):
+    def __init__(self, root_dir, transform=None, img_size=(192, 192)):
+        self.root_dir = root_dir
+        self.img_size = img_size
+        self.transform = transform
+        self.samples = []
 
-def set_seed(seed: int = 42) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+        root_path = Path(root_dir)
 
+        # Quét tất cả ảnh Au và Tp một cách an toàn (không phân biệt hoa thường)
+        all_files = list(root_path.rglob("*"))
+        au_files = []
+        tp_files = []
+        gt_files = {}
 
-def load_yaml_config(config_path: str) -> Dict:
-    path = Path(config_path)
-    if not path.exists():
-        return {}
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+        for p in all_files:
+            if p.is_file() and p.suffix.lower() in [".jpg", ".png", ".tif", ".bmp", ".jpeg"]:
+                parts_lower = [part.lower() for part in p.parts]
+                # Kiểm tra thư mục chứa ảnh
+                if "au" in parts_lower or any("au" in part for part in parts_lower if part != p.name.lower()):
+                    if not "groundtruth" in parts_lower and not "gt_mask" in parts_lower:
+                        au_files.append(p)
+                elif "tp" in parts_lower or any("tp" in part for part in parts_lower if part != p.name.lower()):
+                    if not "groundtruth" in parts_lower and not "gt_mask" in parts_lower:
+                        tp_files.append(p)
 
+                # Kiểm tra thư mục chứa Ground Truth
+                if any(x in parts_lower for x in ["gt_mask", "masks", "casia 2 groundtruth", "groundtruth"]):
+                    stem = p.stem.lower()
+                    gt_files[stem] = p
+                    # Đăng ký thêm biến thể loại bỏ các hậu tố phổ biến
+                    stem_clean = stem.replace("_gt", "").replace("gt", "").replace("_mask", "")
+                    gt_files[stem_clean] = p
 
-def compute_batch_metrics(
-    pred_cls: torch.Tensor,
-    pred_mask: torch.Tensor,
-    target_cls: torch.Tensor,
-    target_mask: torch.Tensor,
-    threshold: float = 0.5,
-) -> Dict[str, float]:
-    """
-    Computes image-level classification accuracy and pixel-level IoU & Dice/F1 score.
-    """
-    with torch.no_grad():
-        # Image-level detection accuracy
-        pred_lbl = (pred_cls.view(-1) >= threshold).float()
-        true_lbl = target_cls.view(-1).float()
-        cls_acc = float((pred_lbl == true_lbl).float().mean().item())
+        # Sắp xếp lại danh sách
+        au_files = sorted(au_files)
+        tp_files = sorted(tp_files)
 
-        # Pixel-level localization F1 and IoU
-        pred_bin = (pred_mask >= threshold).float().view(pred_mask.size(0), -1)
-        true_bin = (target_mask >= threshold).float().view(target_mask.size(0), -1)
+        for path in au_files:
+            self.samples.append({"img_path": str(path), "mask_path": None, "label": 0.0})
 
-        tp = (pred_bin * true_bin).sum(dim=1)
-        fp = (pred_bin * (1.0 - true_bin)).sum(dim=1)
-        fn = ((1.0 - pred_bin) * true_bin).sum(dim=1)
+        matched_mask_count = 0
+        for path in tp_files:
+            stem = path.stem.lower()
+            matched_mask_path = None
+            # Tạo danh sách các ứng viên so khớp phong phú
+            candidates = [
+                stem,
+                stem + "_gt",
+                stem.replace("_tp", "_gt"),
+                stem + "_mask",
+                stem.replace("tp_", "gt_"),
+                stem.replace("_tp", "")
+            ]
+            for cand in candidates:
+                if cand in gt_files:
+                    matched_mask_path = str(gt_files[cand])
+                    break
+            if matched_mask_path:
+                matched_mask_count += 1
+            self.samples.append({"img_path": str(path), "mask_path": matched_mask_path, "label": 1.0})
 
-        eps = 1e-6
-        pixel_f1 = ((2.0 * tp + eps) / (2.0 * tp + fp + fn + eps)).mean().item()
-        pixel_iou = ((tp + eps) / (tp + fp + fn + eps)).mean().item()
+        print(f"[DATASET] Tổng số ảnh Au: {len(au_files)} | Ảnh Tp: {len(tp_files)} | Khớp thành công Mask: {matched_mask_count}")
+        if len(tp_files) > 0 and matched_mask_count == 0:
+            raise RuntimeError("❌ LỖI: Không khớp được bất kỳ mask nào cho tập ảnh Tp!")
 
-    return {
-        "cls_acc": cls_acc,
-        "pixel_f1": float(pixel_f1),
-        "pixel_iou": float(pixel_iou),
-    }
+    def __len__(self):
+        return len(self.samples)
 
+    def __getitem__(self, idx):
+        s = self.samples[idx]
+        img = Image.open(s["img_path"]).convert("RGB")
+        img = img.resize(self.img_size, Image.BILINEAR)
+        img_tensor = torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0
 
-def run_dry_run(
-    device: torch.device,
-    in_channels: int = 9,
-    width_multiplier: float = 0.5,
-    batch_size: int = 4,
-    lr: float = 1e-3,
-    use_amp: bool = True,
-    save_dir: str = "./checkpoints",
-) -> None:
-    """
-    Executes a 3-second synthetic verification pass:
-    Forward -> Multi-Task Loss -> Backward -> Optimizer Step + Checkpoint write test.
-    """
-    t0 = time.perf_counter()
-    print("=" * 72)
-    print("[DRY-RUN] Initializing DWT-MobileUNet Synthetic Verification...")
-    print(f"[DRY-RUN] Device           : {device} (CUDA available: {torch.cuda.is_available()})")
-    if device.type == "cuda":
-        print(f"[DRY-RUN] GPU Name         : {torch.cuda.get_device_name(0)}")
-    print(f"[DRY-RUN] Input Channels   : {in_channels} (Resolution: 192x192)")
-    print(f"[DRY-RUN] AMP FP16 Enabled : {use_amp and device.type == 'cuda'}")
+        mask_tensor = torch.zeros((1, self.img_size[1], self.img_size[0]), dtype=torch.float32)
+        if s["label"] == 1.0 and s["mask_path"]:
+            try:
+                mask = Image.open(s["mask_path"]).convert("L")
+                mask = mask.resize(self.img_size, Image.NEAREST)
+                mask_np = np.array(mask)
+                mask_tensor = torch.from_numpy(mask_np).unsqueeze(0).float() / 255.0
+                mask_tensor = (mask_tensor > 0.5).float()
+            except Exception:
+                pass
+        return img_tensor, mask_tensor, torch.tensor([s["label"]], dtype=torch.float32)
 
-    model = DWTMobileUNet(
-        in_channels=in_channels, width_multiplier=width_multiplier
-    ).to(device)
-    total_params, est_int8_mb = count_parameters(model)
-    print(
-        f"[DRY-RUN] Trainable Params : {total_params:,} (~{est_int8_mb:.3f} MB in INT8, Target < 2.0 MB)"
-    )
-
-    criterion = MultiTaskForensicLoss(cls_weight=0.3, seg_weight=0.7)
-    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    amp_Active = bool(use_amp and device.type == "cuda")
-    scaler = GradScaler(enabled=amp_Active)
-
-    # Synthetic batch: (B, C, 192, 192)
-    synth_x = torch.randn(batch_size, in_channels, 192, 192, device=device)
-    synth_cls = torch.randint(0, 2, (batch_size, 1), device=device).float()
-    synth_mask = torch.randint(0, 2, (batch_size, 1, 192, 192), device=device).float()
-
-    model.train()
-    optimizer.zero_grad(set_to_none=True)
-
-    with autocast(enabled=amp_Active):
-        pred_cls, pred_mask = model(synth_x)
-        loss, loss_dict = criterion(pred_cls, pred_mask, synth_cls, synth_mask)
-
-    scaler.scale(loss).backward()
-    scaler.step(optimizer)
-    scaler.update()
-
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-
-    assert pred_cls.shape == (batch_size, 1), f"Invalid Head 1 shape: {pred_cls.shape}"
-    assert pred_mask.shape == (
-        batch_size,
-        1,
-        192,
-        192,
-    ), f"Invalid Head 2 shape: {pred_mask.shape}"
-
-    # Save a verified dry-run checkpoint if no best_model.pth exists yet (allows immediate export/UI test)
-    save_path = Path(save_dir)
-    save_path.mkdir(parents=True, exist_ok=True)
-    dry_ckpt = save_path / "best_model.pth"
-    if not dry_ckpt.exists():
-        torch.save(
-            {
-                "epoch": 0,
-                "model_state_dict": model.state_dict(),
-                "in_channels": in_channels,
-                "width_multiplier": width_multiplier,
-                "dry_run": True,
-            },
-            dry_ckpt,
+# --- DWT-MOBILEUNET MODEL ---
+class DoubleConv(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
         )
-        print(f"[DRY-RUN] Created initial checkpoint at: {dry_ckpt}")
+    def forward(self, x):
+        return self.net(x)
 
-    elapsed = time.perf_counter() - t0
-    print(f"[DRY-RUN] Head 1 Output    : {tuple(pred_cls.shape)} (P_fake in [0, 1])")
-    print(f"[DRY-RUN] Head 2 Output    : {tuple(pred_mask.shape)} (Mask 192x192x1)")
-    print(
-        f"[DRY-RUN] Loss Breakdown   : Total={loss_dict['loss_total']:.4f} "
-        f"(BCE={loss_dict['loss_bce_cls']:.4f}, Dice={loss_dict['loss_dice']:.4f}, Focal={loss_dict['loss_focal']:.4f})"
-    )
-    print(f"[DRY-RUN] SUCCESS in {elapsed:.2f}s (< 3.0s target). Ready for full training!")
-    print("=" * 72)
+class DWTMobileUNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.inc = DoubleConv(15, 32)
+        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(32, 64))
+        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(64, 128))
+        self.up1 = nn.ConvTranspose2d(128, 64, 2, stride=2)
+        self.conv_up1 = DoubleConv(128, 64)
+        self.up2 = nn.ConvTranspose2d(64, 32, 2, stride=2)
+        self.conv_up2 = DoubleConv(64, 32)
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Linear(128, 1)
+        self.out_mask = nn.Conv2d(32, 1, 1)
 
-
-def train_one_epoch(
-    model: torch.nn.Module,
-    loader: torch.utils.data.DataLoader,
-    criterion: MultiTaskForensicLoss,
-    optimizer: torch.optim.Optimizer,
-    scaler: GradScaler,
-    device: torch.device,
-    amp_enabled: bool,
-) -> Dict[str, float]:
-    model.train()
-    running = {
-        "loss_total": 0.0,
-        "loss_bce_cls": 0.0,
-        "loss_dice": 0.0,
-        "loss_focal": 0.0,
-        "cls_acc": 0.0,
-        "pixel_f1": 0.0,
-        "pixel_iou": 0.0,
-    }
-    num_batches = max(1, len(loader))
-
-    for mra_x, cls_y, mask_y in loader:
-        mra_x = mra_x.to(device, non_blocking=True)
-        cls_y = cls_y.to(device, non_blocking=True)
-        mask_y = mask_y.to(device, non_blocking=True)
-
-        optimizer.zero_grad(set_to_none=True)
-        with autocast(enabled=amp_enabled):
-            pred_cls, pred_mask = model(mra_x)
-            loss, loss_dict = criterion(pred_cls, pred_mask, cls_y, mask_y)
-
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-
-        batch_metrics = compute_batch_metrics(pred_cls, pred_mask, cls_y, mask_y)
-        for k in loss_dict:
-            running[k] += loss_dict[k]
-        for k in batch_metrics:
-            running[k] += batch_metrics[k]
-
-    return {k: v / num_batches for k, v in running.items()}
+    def forward(self, x):
+        dwt_feat = haar_dwt_2d(x)
+        dwt_upsampled = F.interpolate(dwt_feat, size=x.shape[2:], mode="nearest")
+        x_in = torch.cat([x, dwt_upsampled], dim=1)
+        x1 = self.inc(x_in)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        cls_feat = self.gap(x3).view(x3.size(0), -1)
+        logits_cls = self.fc(cls_feat)
+        u1 = self.up1(x3)
+        u1 = torch.cat([u1, x2], dim=1)
+        u1 = self.conv_up1(u1)
+        u2 = self.up2(u1)
+        u2 = torch.cat([u2, x1], dim=1)
+        u2 = self.conv_up2(u2)
+        logits_mask = self.out_mask(u2)
+        return logits_cls, logits_mask
 
 
-@torch.no_grad()
-def evaluate(
-    model: torch.nn.Module,
-    loader: torch.utils.data.DataLoader,
-    criterion: MultiTaskForensicLoss,
-    device: torch.device,
-    amp_enabled: bool,
-) -> Dict[str, float]:
-    model.eval()
-    running = {
-        "loss_total": 0.0,
-        "loss_bce_cls": 0.0,
-        "loss_dice": 0.0,
-        "loss_focal": 0.0,
-        "cls_acc": 0.0,
-        "pixel_f1": 0.0,
-        "pixel_iou": 0.0,
-    }
-    num_batches = max(1, len(loader))
+# --- IMPROVED LOSS FUNCTIONS ---
+class FocalLoss2D(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
 
-    for mra_x, cls_y, mask_y in loader:
-        mra_x = mra_x.to(device, non_blocking=True)
-        cls_y = cls_y.to(device, non_blocking=True)
-        mask_y = mask_y.to(device, non_blocking=True)
+    def forward(self, inputs, targets):
+        inputs = inputs.float()
+        targets = targets.float()
+        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        pt = torch.exp(-bce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        return focal_loss
 
-        with autocast(enabled=amp_enabled):
-            pred_cls, pred_mask = model(mra_x)
-            _, loss_dict = criterion(pred_cls, pred_mask, cls_y, mask_y)
+class ComboSegLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, dice_weight=1.0, focal_weight=1.0):
+        super().__init__()
+        self.focal = FocalLoss2D(alpha=alpha, gamma=gamma)
+        self.dice_weight = dice_weight
+        self.focal_weight = focal_weight
 
-        batch_metrics = compute_batch_metrics(pred_cls, pred_mask, cls_y, mask_y)
-        for k in loss_dict:
-            running[k] += loss_dict[k]
-        for k in batch_metrics:
-            running[k] += batch_metrics[k]
+    def dice_loss(self, preds, targets, smooth=1e-5):
+        preds = torch.sigmoid(preds)
+        intersection = (preds * targets).sum(dim=(2, 3))
+        union = preds.sum(dim=(2, 3)) + targets.sum(dim=(2, 3))
+        dice = (2. * intersection + smooth) / (union + smooth)
+        return 1.0 - dice.mean()
 
-    return {k: v / num_batches for k, v in running.items()}
+    def forward(self, preds, targets):
+        f_loss = self.focal(preds, targets)
+        d_loss = self.dice_loss(preds, targets)
+        return self.focal_weight * f_loss + self.dice_weight * d_loss
 
+# --- LOSS & METRICS ---
+def dice_loss(preds, targets, smooth=1e-5):
+    preds = torch.sigmoid(preds)
+    intersection = (preds * targets).sum(dim=(2, 3))
+    union = preds.sum(dim=(2, 3)) + targets.sum(dim=(2, 3))
+    dice = (2. * intersection + smooth) / (union + smooth)
+    return 1.0 - dice.mean()
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Train DWT-MobileUNet on Google Colab CUDA GPU"
-    )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="configs/config.yaml",
-        help="Path to YAML configuration file",
-    )
-    parser.add_argument(
-        "--data_dir",
-        type=str,
-        default="./data/CASIA2",
-        help="Dataset root directory containing Au/, Tp/, and Gt_mask/",
-    )
-    parser.add_argument(
-        "--save_dir",
-        type=str,
-        default=None,
-        help="Directory to save best_model.pth (e.g., Google Drive path)",
-    )
-    parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=None, help="Mini-batch size")
-    parser.add_argument("--lr", type=float, default=None, help="Initial learning rate")
-    parser.add_argument(
-        "--num_workers", type=int, default=None, help="DataLoader worker processes"
-    )
-    parser.add_argument(
-        "--amp",
-        action="store_true",
-        default=None,
-        help="Enable Automatic Mixed Precision (FP16) on CUDA",
-    )
-    parser.add_argument(
-        "--no-amp",
-        dest="amp",
-        action="store_false",
-        help="Disable Automatic Mixed Precision",
-    )
-    parser.add_argument(
-        "--use-forensic-maps",
-        action="store_true",
-        default=None,
-        help="Include explicit Donoho MAD + ELA maps (11 input channels instead of 9)",
-    )
-    parser.add_argument(
-        "--resume",
-        type=str,
-        default=None,
-        help="Path to checkpoint (.pth) to resume training from",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Run a 3-second synthetic Forward/Loss/Backward/Optimizer check and exit",
-    )
-    return parser.parse_args()
+def calculate_seg_metrics(preds, targets, threshold=0.5, smooth=1e-5):
+    preds = (torch.sigmoid(preds) > threshold).float()
+    targets = (targets > 0.5).float()
+    valid_mask = (targets.sum(dim=(1, 2, 3)) > 0)
+    if not valid_mask.any():
+        return None, None
+    preds = preds[valid_mask]
+    targets = targets[valid_mask]
+    intersection = (preds * targets).sum(dim=(1, 2, 3))
+    union = preds.sum(dim=(1, 2, 3)) + targets.sum(dim=(1, 2, 3))
+    f1 = (2. * intersection + smooth) / (union + smooth)
+    iou = (intersection + smooth) / (union - intersection + smooth)
+    return f1.mean().item(), iou.mean().item()
 
-
-def main() -> None:
-    args = parse_args()
-    cfg = load_yaml_config(args.config)
-
-    seed = cfg.get("project", {}).get("seed", 42)
-    set_seed(seed)
-
-    # Resolve hyperparameters from CLI overrides -> config.yaml -> defaults
-    use_forensic = (
-        args.use_forensic_maps
-        if args.use_forensic_maps is not None
-        else cfg.get("data", {}).get("use_forensic_maps", False)
-    )
-    in_channels = 11 if use_forensic else 9
-    width_mult = cfg.get("model", {}).get("width_multiplier", 0.5)
-    img_size = cfg.get("data", {}).get("img_size", 192)
-    ela_quality = cfg.get("data", {}).get("ela_quality", 90)
-    train_split = cfg.get("data", {}).get("train_split", 0.85)
-    num_workers = (
-        args.num_workers
-        if args.num_workers is not None
-        else cfg.get("data", {}).get("num_workers", 2)
-    )
-
-    epochs = (
-        args.epochs
-        if args.epochs is not None
-        else cfg.get("training", {}).get("epochs", 50)
-    )
-    batch_size = (
-        args.batch_size
-        if args.batch_size is not None
-        else cfg.get("training", {}).get("batch_size", 16)
-    )
-    lr = args.lr if args.lr is not None else cfg.get("training", {}).get("lr", 1e-3)
-    weight_decay = cfg.get("training", {}).get("weight_decay", 1e-4)
-    save_dir = (
-        args.save_dir
-        if args.save_dir is not None
-        else cfg.get("training", {}).get("save_dir", "./checkpoints")
-    )
-    use_amp = (
-        args.amp
-        if args.amp is not None
-        else cfg.get("training", {}).get("amp", True)
-    )
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dir", type=str, required=True)
+    parser.add_argument("--save_dir", type=str, required=True)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=0.001)
+    parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 1. Execute fast 3-second synthetic verification if --dry-run is passed
     if args.dry_run:
-        run_dry_run(
-            device=device,
-            in_channels=in_channels,
-            width_multiplier=width_mult,
-            batch_size=min(batch_size, 4),
-            lr=lr,
-            use_amp=use_amp,
-            save_dir=save_dir,
-        )
-        return
+        print("[DRY-RUN] Bắt đầu xác minh mô hình...")
+        # Model loaded dynamically below
+        x = torch.randn(4, 3, 192, 192).to(device)
+        y_cls, y_seg = model(x)
+        print(f"[DRY-RUN] Tổng số tham số: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+        os.makedirs(args.save_dir, exist_ok=True)
+        torch.save(model.state_dict(), os.path.join(args.save_dir, "best_model.pth"))
+        sys.exit(0)
 
-    # 2. Full CUDA Training Pipeline
-    save_path = Path(save_dir)
-    save_path.mkdir(parents=True, exist_ok=True)
+    dataset = CASIADataset(args.data_dir, img_size=(192, 192))
+    train_size = int(0.85 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42))
 
-    print("=" * 72)
-    print(f"[TRAIN] Starting DWT-MobileUNet Training on {device}")
-    if device.type == "cuda":
-        print(f"[TRAIN] GPU: {torch.cuda.get_device_name(0)} | AMP FP16: {use_amp}")
-    print(f"[TRAIN] Data Directory : {args.data_dir}")
-    print(f"[TRAIN] Save Directory : {save_path.resolve()}")
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
-    train_loader, val_loader, stats = build_dataloaders(
-        data_dir=args.data_dir,
-        img_size=img_size,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        train_split=train_split,
-        use_forensic_maps=use_forensic,
-        ela_quality=ela_quality,
-        seed=seed,
-    )
-    print(
-        f"[TRAIN] Dataset Loaded : Total={stats['total']} "
-        f"(Train={stats['train']}, Val={stats['val']}, "
-        f"Au={stats['authentic']}, Tp={stats['tampered']}, Masks={stats['with_mask']})"
-    )
+    # Model loaded dynamically below
+    
+    model = DWTMobileUNet().to(device)
+    best_model_path = os.path.join(args.save_dir, "best_model.pth")
+    if os.path.exists(best_model_path) and not args.dry_run:
+        print(f"🔄 Phát hiện checkpoint tốt nhất cũ! Đang nạp trọng số từ: {best_model_path} để fine-tune...")
+        try:
+            model.load_state_dict(torch.load(best_model_path, map_location=device))
+            print("✅ Nạp trọng số thành công!")
+        except Exception as e:
+            print(f"⚠️ Lỗi nạp trọng số cũ (Sẽ train từ đầu): {e}")
 
-    model = DWTMobileUNet(
-        in_channels=in_channels,
-        width_multiplier=width_mult,
-        decoder_channels=cfg.get("model", {}).get("decoder_channels", [96, 48, 24, 16]),
-        dropout=cfg.get("model", {}).get("dropout", 0.2),
-    ).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scaler = GradScaler("cuda", enabled=args.amp)
 
-    total_params, est_int8_mb = count_parameters(model)
-    print(f"[TRAIN] Model Footprint: {total_params:,} params (~{est_int8_mb:.3f} MB in INT8)")
+    criterion_cls = nn.BCEWithLogitsLoss()
+    criterion_seg_bce = ComboSegLoss(alpha=0.25, gamma=2.0, dice_weight=1.5, focal_weight=1.0)
+    best_score = 0.0
 
-    criterion = MultiTaskForensicLoss(
-        cls_weight=cfg.get("loss", {}).get("cls_weight", 0.3),
-        seg_weight=cfg.get("loss", {}).get("seg_weight", 0.7),
-        focal_alpha=cfg.get("loss", {}).get("focal_alpha", 0.25),
-        focal_gamma=cfg.get("loss", {}).get("focal_gamma", 2.0),
-    )
-    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.01)
-    amp_enabled = bool(use_amp and device.type == "cuda")
-    scaler = GradScaler(enabled=amp_enabled)
-
-    start_epoch = 1
-    best_score = -1.0
-    history = []
-
-    if args.resume and os.path.isfile(args.resume):
-        ckpt = torch.load(args.resume, map_location=device)
-        model.load_state_dict(ckpt["model_state_dict"])
-        if "optimizer_state_dict" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        start_epoch = ckpt.get("epoch", 0) + 1
-        best_score = ckpt.get("best_score", -1.0)
-        print(f"[TRAIN] Resumed from {args.resume} (Epoch {start_epoch})")
-
-    for epoch in range(start_epoch, epochs + 1):
-        t_ep = time.perf_counter()
-        train_metrics = train_one_epoch(
-            model, train_loader, criterion, optimizer, scaler, device, amp_enabled
-        )
-        val_metrics = evaluate(model, val_loader, criterion, device, amp_enabled)
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        train_loss = 0.0
+        for imgs, masks, labels in train_loader:
+            imgs, masks, labels = imgs.to(device), masks.to(device), labels.to(device)
+            optimizer.zero_grad()
+            with autocast("cuda", enabled=args.amp):
+                logits_cls, logits_mask = model(imgs)
+                loss_cls = criterion_cls(logits_cls, labels)
+                tp_mask = (labels == 1.0).squeeze()
+                if tp_mask.sum() > 0:
+                    logits_mask_tp = logits_mask[tp_mask]
+                    masks_tp = masks[tp_mask]
+                    loss_seg = criterion_seg_bce(logits_mask_tp, masks_tp) + dice_loss(logits_mask_tp, masks_tp)
+                else:
+                    loss_seg = 0.0
+                total_loss = loss_cls + 2.5 * loss_seg
+            scaler.scale(total_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            train_loss += total_loss.item()
         scheduler.step()
 
-        # Combined selection metric: 0.3 * Cls_Acc + 0.7 * Pixel_F1
-        val_composite = (
-            0.3 * val_metrics["cls_acc"] + 0.7 * val_metrics["pixel_f1"]
-        )
-        dt = time.perf_counter() - t_ep
+        model.eval()
+        val_cls_correct = 0
+        val_total = 0
+        val_pixel_f1s, val_pixel_ious = [], []
+        with torch.no_grad():
+            for imgs, masks, labels in val_loader:
+                imgs, masks, labels = imgs.to(device), masks.to(device), labels.to(device)
+                with autocast("cuda", enabled=args.amp):
+                    logits_cls, logits_mask = model(imgs)
+                preds_cls = (torch.sigmoid(logits_cls) > 0.5).float()
+                val_cls_correct += (preds_cls == labels).sum().item()
+                val_total += labels.size(0)
+                f1, iou = calculate_seg_metrics(logits_mask, masks)
+                if f1 is not None:
+                    val_pixel_f1s.append(f1)
+                    val_pixel_ious.append(iou)
 
-        print(
-            f"Epoch [{epoch:03d}/{epochs:03d}] ({dt:.1f}s) | "
-            f"Train Loss: {train_metrics['loss_total']:.4f} (F1: {train_metrics['pixel_f1']:.4f}) | "
-            f"Val Loss: {val_metrics['loss_total']:.4f} | "
-            f"Val Acc: {val_metrics['cls_acc']*100:.2f}% | "
-            f"Val Pixel-F1: {val_metrics['pixel_f1']:.4f} | "
-            f"Val IoU: {val_metrics['pixel_iou']:.4f}"
-        )
+        val_acc = val_cls_correct / val_total
+        avg_pixel_f1 = np.mean(val_pixel_f1s) if val_pixel_f1s else 0.0
+        avg_pixel_iou = np.mean(val_pixel_ious) if val_pixel_ious else 0.0
+        composite_score = 0.5 * val_acc + 0.5 * avg_pixel_f1
+        print(f"Epoch [{epoch:03d}/{args.epochs:03d}] | Train Loss: {train_loss/len(train_loader):.4f} | Val Acc: {val_acc*100:.2f}% | Val Pixel-F1: {avg_pixel_f1:.4f} | Val IoU: {avg_pixel_iou:.4f}")
 
-        ckpt_payload = {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "best_score": max(best_score, val_composite),
-            "in_channels": in_channels,
-            "width_multiplier": width_mult,
-            "use_forensic_maps": use_forensic,
-            "val_metrics": val_metrics,
-        }
-
-        # Always update last_model.pth for fault-tolerant Colab resumption
-        torch.save(ckpt_payload, save_path / "last_model.pth")
-
-        if val_composite >= best_score:
-            best_score = val_composite
-            torch.save(ckpt_payload, save_path / "best_model.pth")
-            print(
-                f"  --> [Saved New Best Model] Composite Score: {best_score:.4f} -> {save_path / 'best_model.pth'}"
-            )
-
-        history.append(
-            {
-                "epoch": epoch,
-                "train": train_metrics,
-                "val": val_metrics,
-                "val_composite": val_composite,
-            }
-        )
-        with open(save_path / "training_history.json", "w", encoding="utf-8") as f:
-            json.dump(history, f, indent=2)
-
-    print("=" * 72)
-    print(f"[TRAIN] Completed! Best Composite Score: {best_score:.4f}")
-    print(f"[TRAIN] Best Checkpoint: {save_path / 'best_model.pth'}")
-    print("=" * 72)
-
-
-if __name__ == "__main__":
-    main()
+        if composite_score > best_score:
+            best_score = composite_score
+            torch.save(model.state_dict(), os.path.join(args.save_dir, "best_model.pth"))
+            print(f"  --> [Saved New Best Model] Composite Score: {best_score:.4f}")
