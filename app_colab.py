@@ -47,8 +47,9 @@ def build_gradio_app(predictor: EmbeddedForensicPredictor) -> gr.Blocks:
         badge_color = "#dc2626" if res["is_forged"] else "#16a34a"
         summary_md = (
             f"<div style='padding:12px;border-radius:8px;background:{badge_color};color:white;font-weight:bold;font-size:16px;'>"
-            f"KẾT LUẬN: {res['label']} — Xác suất giả mạo P_fake = {p_fake * 100:.2f}% (Ngưỡng T = {threshold:.2f})"
+            f"KẾT LUẬN: {res['label']} — Xác suất Model (Head 1) P_fake = {p_fake * 100:.2f}% (Ngưỡng T = {threshold:.2f})"
             f"</div>\n\n"
+            f"- **Quy tắc quyết định:** `{res['decision_rule']}` | **Điểm kết hợp (Cls+Mask):** `{res['combined_score'] * 100:.2f}%` | **Số vùng khoanh đỏ:** `{res['num_contours']}`\n"
             f"- **Backend:** `{res['backend']}` | **Độ phân giải gốc:** `{res['resolution']}`\n"
             f"- **Chế độ suy luận thực tế:** `{res['mode_used'].upper()}` (`{res['num_patches']}` patch $192 \\times 192$, `stride=160`)\n"
             f"- **Thời gian xử lý:** `{res['latency_ms']:.1f} ms` (`{res['latency_s']:.3f} s`) | **RAM tiêu thụ:** `{res['ram_mb']:.1f} MB`"

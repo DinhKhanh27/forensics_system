@@ -1,12 +1,12 @@
 """
 Model Export & INT8 Quantization Pipeline (PyTorch -> ONNX FP32 -> ONNX INT8).
 
-Fixes & Improvements:
-1. Universal Checkpoint Support: Automatically detects and loads either `DWTMobileUNet`
-   (MobileNetV3-Small + 2-Level Haar DWT) or `LegacyDWTUNet` (commit 8d0513a checkpoint)
-   with `return_logits=False` so that `torch.sigmoid` is ALWAYS baked into the exported
-   ONNX graph (`prob_fake` in [0, 1] and `mask_prob` in [0, 1]).
-2. Strict < 2.0 MB INT8 size verification and latency benchmarking.
+Fixes Addressing Code Review:
+1. Fail-Fast Checkpoint Verification:
+   - Raises a clear `FileNotFoundError` if `--checkpoint` does not exist, and raises a
+     `RuntimeError` if the checkpoint was created by `--dry-run` (`dry_run == True`),
+     unless `--allow-untrained-demo` is explicitly passed on the CLI.
+2. Exports calibrated Sigmoid outputs (`prob_fake` in [0, 1] and `mask_prob` in [0, 1]).
 """
 
 import argparse
@@ -35,11 +35,6 @@ from src.model import (
 
 
 class SyntheticMRADataReader(CalibrationDataReader):
-    """
-    Calibration dataset reader generating representative inputs in [0, 1] (for 3-ch RGB)
-    or Z-score normalized (for 9/11-ch MRA) for static INT8 quantization.
-    """
-
     def __init__(self, input_name: str, in_channels: int = 3, num_samples: int = 24) -> None:
         self.input_name = input_name
         self.in_channels = in_channels
@@ -66,15 +61,28 @@ class SyntheticMRADataReader(CalibrationDataReader):
 
 
 def load_or_init_pytorch_model(
-    checkpoint_path: Path, use_forensic_maps: bool = False
+    checkpoint_path: Path,
+    use_forensic_maps: bool = False,
+    allow_untrained_demo: bool = False,
 ) -> Tuple[nn.Module, int]:
     """
-    Loads trained weights from `checkpoint_path` with `return_logits=False` (ensuring
-    Sigmoid probabilities in [0, 1] are exported into the ONNX graph).
+    Loads trained weights from `checkpoint_path` with `return_logits=False`.
+    Fails fast if the checkpoint is missing or is an untrained `--dry-run` artifact,
+    unless `allow_untrained_demo=True` is explicitly passed.
     """
     default_in_ch = 11 if use_forensic_maps else 3
 
     if checkpoint_path and checkpoint_path.exists():
+        raw_ckpt = torch.load(checkpoint_path, map_location="cpu")
+        if (
+            isinstance(raw_ckpt, dict)
+            and raw_ckpt.get("dry_run", False)
+            and not allow_untrained_demo
+        ):
+            raise RuntimeError(
+                f"❌ LỖI: Checkpoint '{checkpoint_path}' là trọng số ngẫu nhiên từ --dry-run! "
+                "Vui lòng chạy huấn luyện thật (train.py) trước khi xuất ONNX, hoặc truyền --allow-untrained-demo nếu chỉ muốn kiểm thử kỹ thuật."
+            )
         model, in_channels, arch_name = load_forensic_checkpoint(
             str(checkpoint_path),
             device="cpu",
@@ -84,15 +92,22 @@ def load_or_init_pytorch_model(
         print(
             f"[EXPORT] Loaded trained '{arch_name}' weights from {checkpoint_path} (in_channels={in_channels}, Sigmoid=ON)"
         )
-    else:
-        print(
-            f"[EXPORT] Checkpoint '{checkpoint_path}' not found. Initializing fresh DWTMobileUNet for export verification."
-        )
-        in_channels = default_in_ch
-        model = DWTMobileUNet(
-            in_channels=in_channels, width_multiplier=0.5, return_logits=False
+        model.eval()
+        return model, in_channels
+
+    if not allow_untrained_demo:
+        raise FileNotFoundError(
+            f"❌ LỖI: Không tìm thấy file checkpoint đã huấn luyện tại '{checkpoint_path}'. "
+            "Hãy chạy train.py để tạo best_model.pth trước, hoặc thêm cờ --allow-untrained-demo nếu muốn xuất mô hình rỗng để test pipeline."
         )
 
+    print(
+        f"⚠️ [DEMO MODE] Checkpoint '{checkpoint_path}' không tồn tại; khởi tạo mô hình chưa huấn luyện do cờ --allow-untrained-demo được bật."
+    )
+    in_channels = default_in_ch
+    model = DWTMobileUNet(
+        in_channels=in_channels, width_multiplier=0.5, return_logits=False
+    )
     model.eval()
     return model, in_channels
 
@@ -100,11 +115,6 @@ def load_or_init_pytorch_model(
 def export_to_onnx(
     model: nn.Module, in_channels: int, onnx_fp32_path: Path, opset: int = 13
 ) -> None:
-    """
-    Exports PyTorch model to ONNX FP32 with calibrated Sigmoid outputs:
-      - prob_fake: (B, 1) in [0, 1]
-      - mask_prob: (B, 1, 192, 192) in [0, 1]
-    """
     dummy_input = torch.rand(1, in_channels, 192, 192, dtype=torch.float32)
     torch.onnx.export(
         model,
@@ -234,7 +244,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--use-forensic-maps",
         action="store_true",
-        help="Use 11-channel input (RGB + 6 DWT + MAD + ELA) if checkpoint is not found",
+        help="Use 11-channel input (RGB + 6 DWT + MAD + ELA)",
+    )
+    parser.add_argument(
+        "--allow-untrained-demo",
+        action="store_true",
+        help="Explicitly allow exporting an untrained random model for pipeline testing only",
     )
     return parser.parse_args()
 
@@ -249,7 +264,9 @@ def main() -> None:
     onnx_int8_path = out_dir / "model_int8.onnx"
 
     model, in_channels = load_or_init_pytorch_model(
-        ckpt_path, use_forensic_maps=args.use_forensic_maps
+        ckpt_path,
+        use_forensic_maps=args.use_forensic_maps,
+        allow_untrained_demo=args.allow_untrained_demo,
     )
     params, _ = count_parameters(model)
     print(f"[EXPORT] Model Parameters: {params:,} | Input Channels: {in_channels}")

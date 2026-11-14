@@ -1,21 +1,29 @@
 """
-Forensic Image Dataset & Stratified DataLoader Module (CASIA v2.0, Columbia, NIST16).
+Forensic Image Dataset & Group-Aware Stratified DataLoader Module (CASIA v2.0, Columbia, NIST16).
 
-Key Improvements:
-1. Hybrid Multi-Scale Training (50% Native JPEG-Aligned Crop + 50% Full-Image Resize):
-   - Directly solves the Train-Test Domain Gap between 'fast' mode (resized full image) and
-     'tile' mode (192x192 sliding window patches at native resolution).
-   - With 50% probability during training, extracts a native-resolution 192x192 patch aligned
-     to the 8x8 JPEG grid (x0 % 8 == 0, y0 % 8 == 0), guided toward forgery boundaries on Tp
-     images so the 2-Level Haar DWT learns un-interpolated micro-noise and JPEG block artifacts.
-   - With 50% probability, resizes the full image to 192x192 so the model also learns global
-     scene context.
-2. Stratified Train/Validation Split & Joint Geometry-Preserving Augmentations.
+Fixes & Improvements Addressing Code Review:
+1. Strict Mask & Image Validation at Scan Time (`_is_valid_tampered_mask`):
+   - Verifies that every matched mask for a Tampered (`Tp`) image is readable and contains
+     actual foreground tampered pixels (> 0 positive pixels). Corrupted or empty masks are
+     filtered out and logged in `stats['corrupted_or_empty_masks']` instead of silently
+     falling back to all-zero masks in `__getitem__`.
+2. Zero Silent Exception Swallowing in `__getitem__`:
+   - Removed `try ... except: pass` when reading masks. If a `Tp` sample has `label == 1.0`,
+     its mask is guaranteed to contain positive tampered pixels so classification and
+     localization supervision never contradict each other.
+3. Leak-Free Group-Aware Stratified Split (`_extract_source_group_id`):
+   - Extracts source image identifiers from CASIA v2 filenames (e.g., `ani00018`, `nat00056`)
+     so tampered splice variants and their source authentic images are grouped into the same
+     split (Train or Val), preventing source-image data leakage.
+   - Raises a clear `ValueError` if the dataset is too small to form a non-empty, independent
+     Validation set (never falls back to `val_samples = train_samples`).
 """
 
 import random
+import re
+from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 from PIL import Image
 import torch
@@ -24,12 +32,48 @@ from torch.utils.data import Dataset, DataLoader
 from src.dwt import MRAPreprocessor
 
 VALID_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
+_CASIA_ID_PATTERN = re.compile(r"([a-z]{3}\d{5})", re.IGNORECASE)
+
+
+def _extract_source_group_id(img_path: Path) -> str:
+    """
+    Extracts a canonical source group key from forensic image filenames to prevent
+    data leakage between Train and Validation splits.
+    - For CASIA v2 (e.g., `Au_ani_00018.jpg` or `Tp_D_NRN_S_N_ani00018_sec00096_00138.jpg`),
+      normalizes `ani_00018` -> `ani00018` and uses the primary source ID.
+    - For other datasets, groups by base stem prefix before the last underscore.
+    """
+    stem_norm = img_path.stem.lower().replace("_", "")
+    matches = _CASIA_ID_PATTERN.findall(stem_norm)
+    if matches:
+        return matches[0].lower()
+    parts = img_path.stem.lower().split("_")
+    if len(parts) >= 2:
+        return "_".join(parts[:-1])
+    return img_path.stem.lower()
+
+
+def _is_valid_tampered_mask(mask_path: Path, min_positive_pixels: int = 16) -> bool:
+    """
+    Verifies at dataset scan time that a ground-truth mask is readable and contains
+    at least `min_positive_pixels` foreground pixels.
+    """
+    try:
+        with Image.open(mask_path) as m_img:
+            mask_arr = np.array(m_img.convert("L"), dtype=np.uint8)
+        pos_count = int(np.sum(mask_arr > 127))
+        total_pixels = int(mask_arr.size)
+        # Must have foreground pixels and not be a completely white corrupted mask
+        return pos_count >= min_positive_pixels and pos_count < int(total_pixels * 0.99)
+    except Exception:
+        return False
 
 
 def scan_casia_forensic_dir(root_dir: str) -> Tuple[List[Dict], Dict[str, int]]:
     """
     Recursively scans `root_dir` (using paths relative to `root_dir`) for Authentic (`Au`),
-    Tampered (`Tp`), and Ground-Truth mask files (`Gt_mask`, `CASIA 2 Groundtruth`, `masks`).
+    Tampered (`Tp`), and Ground-Truth mask files (`Gt_mask`, `CASIA 2 Groundtruth`, `masks`),
+    validating mask integrity upfront.
     """
     root_path = Path(root_dir)
     if not root_path.exists():
@@ -74,14 +118,29 @@ def scan_casia_forensic_dir(root_dir: str) -> Tuple[List[Dict], Dict[str, int]]:
     tp_files.sort()
 
     samples: List[Dict] = []
+    corrupted_au = 0
     for path in au_files:
-        samples.append({"img_path": str(path), "mask_path": None, "label": 0.0})
+        try:
+            with Image.open(path) as im:
+                im.verify()
+            samples.append(
+                {
+                    "img_path": str(path),
+                    "mask_path": None,
+                    "label": 0.0,
+                    "group_id": _extract_source_group_id(path),
+                }
+            )
+        except Exception:
+            corrupted_au += 1
 
     matched_mask_count = 0
     unmatched_tp = 0
+    corrupted_or_empty_masks = 0
+
     for path in tp_files:
         stem = path.stem.lower()
-        matched_mask_path = None
+        matched_mask_path: Optional[Path] = None
         candidates = [
             stem,
             stem + "_gt",
@@ -93,28 +152,39 @@ def scan_casia_forensic_dir(root_dir: str) -> Tuple[List[Dict], Dict[str, int]]:
         ]
         for cand in candidates:
             if cand in gt_files:
-                matched_mask_path = str(gt_files[cand])
+                matched_mask_path = gt_files[cand]
                 break
 
-        if matched_mask_path is not None:
-            matched_mask_count += 1
-            samples.append(
-                {"img_path": str(path), "mask_path": matched_mask_path, "label": 1.0}
-            )
-        else:
+        if matched_mask_path is None:
             unmatched_tp += 1
+            continue
+
+        if not _is_valid_tampered_mask(matched_mask_path):
+            corrupted_or_empty_masks += 1
+            continue
+
+        matched_mask_count += 1
+        samples.append(
+            {
+                "img_path": str(path),
+                "mask_path": str(matched_mask_path),
+                "label": 1.0,
+                "group_id": _extract_source_group_id(path),
+            }
+        )
 
     if len(tp_files) > 0 and matched_mask_count == 0:
         raise RuntimeError(
-            f"❌ LỖI: Tìm thấy {len(tp_files)} ảnh Tp nhưng không khớp được mask nào trong {root_dir}!"
+            f"❌ LỖI: Tìm thấy {len(tp_files)} ảnh Tp nhưng không khớp được mask hợp lệ nào trong {root_dir}!"
         )
 
     stats = {
         "total": len(samples),
-        "authentic": len(au_files),
+        "authentic": len(au_files) - corrupted_au,
         "tampered": matched_mask_count,
         "with_mask": matched_mask_count,
         "skipped_unmatched_tp": unmatched_tp,
+        "corrupted_or_empty_masks": corrupted_or_empty_masks,
     }
     return samples, stats
 
@@ -122,8 +192,8 @@ def scan_casia_forensic_dir(root_dir: str) -> Tuple[List[Dict], Dict[str, int]]:
 class CASIADataset(Dataset):
     """
     Dataset returning `(img_or_mra_tensor, mask_tensor, label_tensor)`.
-    Uses Hybrid Crop + Resize during training so the model excels at BOTH native-resolution
-    sliding window patches ('tile' mode) and full-image resizes ('fast' mode).
+    Guarantees label-mask consistency: every `Tp` sample (`label == 1.0`) has a verified
+    non-empty binary mask.
     """
 
     def __init__(
@@ -141,8 +211,8 @@ class CASIADataset(Dataset):
             self.samples, self.stats = scan_casia_forensic_dir(str(samples_or_root))
             print(
                 f"[DATASET] Tổng số ảnh Au: {self.stats['authentic']} | "
-                f"Ảnh Tp (có Mask): {self.stats['tampered']} | "
-                f"Bỏ qua Tp thiếu Mask: {self.stats['skipped_unmatched_tp']}"
+                f"Ảnh Tp (Mask hợp lệ): {self.stats['tampered']} | "
+                f"Bỏ qua Tp thiếu/lỗi Mask: {self.stats['skipped_unmatched_tp'] + self.stats['corrupted_or_empty_masks']}"
             )
         else:
             self.samples = samples_or_root
@@ -180,8 +250,8 @@ class CASIADataset(Dataset):
         """
         Extracts a native-resolution (target_h x target_w) patch whose top-left coordinates
         (y0, x0) are multiples of 8 (preserving the 8x8 JPEG block grid phase).
-        For Tampered (Tp) images, centers the crop around a forged pixel so the patch contains
-        actual tampered boundaries.
+        For Tampered (Tp) images, centers the crop on a foreground tampered pixel so the
+        cropped patch is guaranteed to contain tampered pixels (`label == 1.0`).
         """
         h, w = img_full.shape[:2]
         max_y = h - target_h
@@ -192,27 +262,41 @@ class CASIADataset(Dataset):
             if len(fg_ys) > 0:
                 idx = random.randint(0, len(fg_ys) - 1)
                 cy, cx = int(fg_ys[idx]), int(fg_xs[idx])
-                jitter_y = random.randint(-target_h // 3, target_h // 3)
-                jitter_x = random.randint(-target_w // 3, target_w // 3)
+                jitter_y = random.randint(-target_h // 4, target_h // 4)
+                jitter_x = random.randint(-target_w // 4, target_w // 4)
                 y0 = max(0, min(max_y, cy - target_h // 2 + jitter_y))
                 x0 = max(0, min(max_x, cx - target_w // 2 + jitter_x))
-                # Snap to 8x8 JPEG block grid
                 y0 = min(max_y, (y0 // 8) * 8)
                 x0 = min(max_x, (x0 // 8) * 8)
                 crop_img = img_full[y0 : y0 + target_h, x0 : x0 + target_w]
                 crop_mask = mask_full[y0 : y0 + target_h, x0 : x0 + target_w]
-                eff_label = 1.0 if float(crop_mask.sum()) >= 16.0 else 0.0
-                return crop_img, crop_mask, eff_label
+                if float(crop_mask.sum()) >= 16.0:
+                    return crop_img, crop_mask, 1.0
+            # Fallback to full-image resize if 8x8 grid snap missed a tiny forgery region
+            img_resized = np.array(
+                Image.fromarray(img_full).resize((target_w, target_h), Image.BILINEAR),
+                dtype=np.uint8,
+            )
+            mask_resized = (
+                np.array(
+                    Image.fromarray((mask_full * 255).astype(np.uint8)).resize(
+                        (target_w, target_h), Image.NEAREST
+                    ),
+                    dtype=np.float32,
+                )
+                / 255.0
+                > 0.5
+            ).astype(np.float32)
+            return img_resized, mask_resized, 1.0
 
-        # Random 8x8-aligned crop for Authentic images
+        # Authentic image (label == 0.0): random 8x8-aligned crop
         y_steps = max(0, max_y // 8)
         x_steps = max(0, max_x // 8)
         y0 = random.randint(0, y_steps) * 8
         x0 = random.randint(0, x_steps) * 8
         crop_img = img_full[y0 : y0 + target_h, x0 : x0 + target_w]
-        crop_mask = mask_full[y0 : y0 + target_h, x0 : x0 + target_w]
-        eff_label = 1.0 if float(crop_mask.sum()) >= 16.0 else 0.0
-        return crop_img, crop_mask, eff_label
+        crop_mask = np.zeros((target_h, target_w), dtype=np.float32)
+        return crop_img, crop_mask, 0.0
 
     def _augment_joint(
         self, img_np: np.ndarray, mask_np: np.ndarray
@@ -252,35 +336,39 @@ class CASIADataset(Dataset):
 
             if use_native_crop:
                 img_full = np.array(img_rgb, dtype=np.uint8)
-                mask_full = np.zeros((orig_h, orig_w), dtype=np.float32)
-                if label == 1.0 and s["mask_path"]:
-                    try:
-                        with Image.open(s["mask_path"]) as mask_pil:
-                            mask_pil = mask_pil.convert("L")
-                            if mask_pil.size != (orig_w, orig_h):
-                                mask_pil = mask_pil.resize((orig_w, orig_h), Image.NEAREST)
-                            mask_full = (
-                                np.array(mask_pil, dtype=np.float32) / 255.0 > 0.5
-                            ).astype(np.float32)
-                    except Exception:
-                        pass
+                if label == 1.0:
+                    if not s["mask_path"]:
+                        raise RuntimeError(f"Tampered sample missing mask_path: {s['img_path']}")
+                    with Image.open(s["mask_path"]) as mask_pil:
+                        mask_pil = mask_pil.convert("L")
+                        if mask_pil.size != (orig_w, orig_h):
+                            mask_pil = mask_pil.resize((orig_w, orig_h), Image.NEAREST)
+                        mask_full = (
+                            np.array(mask_pil, dtype=np.float32) / 255.0 > 0.5
+                        ).astype(np.float32)
+                else:
+                    mask_full = np.zeros((orig_h, orig_w), dtype=np.float32)
+
                 img_np, mask_np, label = self._extract_jpeg_aligned_crop(
                     img_full, mask_full, target_h, target_w, label
                 )
             else:
                 img_resized = img_rgb.resize((target_w, target_h), Image.BILINEAR)
                 img_np = np.array(img_resized, dtype=np.uint8)
-                mask_np = np.zeros((target_h, target_w), dtype=np.float32)
-                if label == 1.0 and s["mask_path"]:
-                    try:
-                        with Image.open(s["mask_path"]) as mask_pil:
-                            mask_pil = mask_pil.convert("L").resize(
-                                (target_w, target_h), Image.NEAREST
-                            )
-                            mask_raw = np.array(mask_pil, dtype=np.float32) / 255.0
-                            mask_np = (mask_raw > 0.5).astype(np.float32)
-                    except Exception:
-                        pass
+                if label == 1.0:
+                    if not s["mask_path"]:
+                        raise RuntimeError(f"Tampered sample missing mask_path: {s['img_path']}")
+                    with Image.open(s["mask_path"]) as mask_pil:
+                        mask_pil = mask_pil.convert("L").resize(
+                            (target_w, target_h), Image.NEAREST
+                        )
+                        mask_raw = np.array(mask_pil, dtype=np.float32) / 255.0
+                        mask_np = (mask_raw > 0.5).astype(np.float32)
+                        # If nearest-neighbor downscaling lost a 1-pixel thin line, preserve max pooling
+                        if float(mask_np.sum()) == 0.0:
+                            mask_np = (mask_raw > 0.05).astype(np.float32)
+                else:
+                    mask_np = np.zeros((target_h, target_w), dtype=np.float32)
 
         if self.is_train:
             img_np, mask_np = self._augment_joint(img_np, mask_np)
@@ -298,8 +386,67 @@ class CASIADataset(Dataset):
         return img_tensor, mask_tensor, label_tensor
 
 
+def _group_stratified_split(
+    samples: List[Dict], train_split: float = 0.85, seed: int = 42
+) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Splits samples into independent Train and Validation sets while keeping all images
+    sharing the same `group_id` (source scene/background ID) in the same split.
+    """
+    groups: Dict[str, List[Dict]] = defaultdict(list)
+    for s in samples:
+        gid = s.get("group_id", Path(s["img_path"]).stem.lower())
+        groups[gid].append(s)
+
+    # Separate groups that contain Tampered samples vs Authentic-only groups for stratification
+    tp_groups = []
+    au_groups = []
+    for gid, grp_items in groups.items():
+        has_tp = any(item["label"] == 1.0 for item in grp_items)
+        if has_tp:
+            tp_groups.append(grp_items)
+        else:
+            au_groups.append(grp_items)
+
+    rng = random.Random(seed)
+    rng.shuffle(tp_groups)
+    rng.shuffle(au_groups)
+
+    def _split_group_list(grp_list: List[List[Dict]]) -> Tuple[List[Dict], List[Dict]]:
+        if len(grp_list) < 2:
+            raise ValueError(
+                f"❌ Không đủ số nhóm độc lập ({len(grp_list)}) để tách tập Train và Validation độc lập!"
+            )
+        n_total_items = sum(len(g) for g in grp_list)
+        target_train = max(1, int(n_total_items * train_split))
+        train_out: List[Dict] = []
+        val_out: List[Dict] = []
+        for idx, g in enumerate(grp_list):
+            # Ensure at least the last group goes to val_out
+            if len(train_out) < target_train and idx < len(grp_list) - 1:
+                train_out.extend(g)
+            else:
+                val_out.extend(g)
+        return train_out, val_out
+
+    train_tp, val_tp = _split_group_list(tp_groups)
+    train_au, val_au = _split_group_list(au_groups)
+
+    train_samples = train_au + train_tp
+    val_samples = val_au + val_tp
+
+    if len(train_samples) == 0 or len(val_samples) == 0:
+        raise ValueError(
+            f"❌ Tập dữ liệu quá nhỏ để tách Train ({len(train_samples)}) và Val ({len(val_samples)}) độc lập!"
+        )
+
+    rng.shuffle(train_samples)
+    return train_samples, val_samples
+
+
 def build_dataloaders(
     data_dir: str,
+    val_dir: Optional[str] = None,
     img_size: int = 192,
     batch_size: int = 16,
     num_workers: int = 2,
@@ -309,25 +456,22 @@ def build_dataloaders(
     native_crop_prob: float = 0.5,
     seed: int = 42,
 ) -> Tuple[DataLoader, DataLoader, Dict[str, int]]:
+    """
+    Builds leak-free Group-Aware Stratified Train & Validation DataLoaders.
+    If `val_dir` is provided explicitly, loads Validation samples from `val_dir`.
+    """
     samples, stats = scan_casia_forensic_dir(data_dir)
 
-    au_samples = [s for s in samples if s["label"] == 0.0]
-    tp_samples = [s for s in samples if s["label"] == 1.0]
-
-    rng = random.Random(seed)
-    rng.shuffle(au_samples)
-    rng.shuffle(tp_samples)
-
-    n_au_train = int(len(au_samples) * train_split)
-    n_tp_train = int(len(tp_samples) * train_split)
-
-    train_samples = au_samples[:n_au_train] + tp_samples[:n_tp_train]
-    val_samples = au_samples[n_au_train:] + tp_samples[n_tp_train:]
-
-    if len(val_samples) == 0:
-        val_samples = train_samples
-
-    rng.shuffle(train_samples)
+    if val_dir is not None and Path(val_dir).exists():
+        train_samples = samples
+        val_samples, val_stats = scan_casia_forensic_dir(val_dir)
+        if len(val_samples) == 0:
+            raise ValueError(f"❌ Thư mục validation '{val_dir}' không có mẫu hợp lệ nào!")
+        stats["val_external"] = val_stats["total"]
+    else:
+        train_samples, val_samples = _group_stratified_split(
+            samples, train_split=train_split, seed=seed
+        )
 
     train_ds = CASIADataset(
         train_samples,

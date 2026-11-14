@@ -1,26 +1,20 @@
 """
 Google Colab CUDA Multi-Round Training CLI for DWT-MobileUNet (`train.py`).
 
-Supports:
-1. Single-Round or Multi-Round Progressive Training (`--round_id`, `--num_rounds`).
-   - Automatically chains rounds (loading `best_model.pth` from Round R-1 into Round R
-     with progressive learning rate scaling and Cosine Annealing warm restarts).
-   - Saves both global `best_model.pth`, `last_model.pth`, and per-round snapshots
-     (`round_1_best.pth`, `round_2_best.pth`, ...) to Google Drive (`--save_dir`).
-2. Full Supervision on BOTH Authentic (`Au`) and Tampered (`Tp`) masks to eliminate
-   false-positive masks during real-world inference.
-3. End-of-Round Real-World Inference Sanity Check on 1 Authentic + 1 Tampered validation
-   sample to verify calibrated Sigmoid probabilities (`P_fake` in [0, 1]) and mask IoU.
+Fixes Addressing Code Review:
+1. `--dry-run` NEVER writes to `best_model.pth` (saves only to a separate `dry_run.pth`
+   or skips overwriting real checkpoints so an interrupted training session never exports
+   untrained random weights).
+2. Group-Aware Stratified Validation Split (`--val_dir` optional for cross-dataset eval).
+3. Refuses to load `dry_run` checkpoints during real training.
 """
 
 import argparse
 import json
 import os
 import random
-import shutil
 import sys
 import time
-from pathlib import Path
 from typing import Dict, List, Optional
 import numpy as np
 import torch
@@ -71,6 +65,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="./data/CASIA2",
         help="Dataset root directory containing Au/, Tp/, and Gt_mask / CASIA 2 Groundtruth",
+    )
+    parser.add_argument(
+        "--val_dir",
+        type=str,
+        default=None,
+        help="Optional independent validation dataset directory",
     )
     parser.add_argument(
         "--save_dir",
@@ -141,7 +141,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Run a 3-second synthetic Forward/Loss/Backward/Optimizer check and exit",
+        help="Run a 3-second synthetic Forward/Loss/Backward/Optimizer check (saves only dry_run.pth)",
     )
     return parser.parse_args()
 
@@ -179,7 +179,7 @@ def run_real_sanity_check(
         fp_area_au = float((torch.sigmoid(logits_m) >= 0.5).float().mean().item()) * 100.0
         verdict_au = "ĐÚNG (ẢNH THẬT)" if p_fake_au < 50.0 else "SAI (BÁO GIẢ)"
         print(
-            f"    • Mẫu Ảnh Thật (Au) : P_fake = {p_fake_au:5.2f}% | Vùng báo giả = {fp_area_au:5.2f}% -> {verdict_au}"
+            f"    • Mẫu Ảnh Thật (Au) : model_prob_cls = {p_fake_au:5.2f}% | Vùng báo giả = {fp_area_au:5.2f}% -> {verdict_au}"
         )
 
     if tp_sample is not None:
@@ -192,7 +192,7 @@ def run_real_sanity_check(
         f1_tp = (2.0 * inter + 1e-5) / (union + 1e-5)
         verdict_tp = "ĐÚNG (ẢNH GIẢ)" if p_fake_tp >= 50.0 else "SAI (BỎ SÓT)"
         print(
-            f"    • Mẫu Ảnh Giả  (Tp) : P_fake = {p_fake_tp:5.2f}% | Pixel-F1 = {f1_tp:.4f}     -> {verdict_tp}"
+            f"    • Mẫu Ảnh Giả  (Tp) : model_prob_cls = {p_fake_tp:5.2f}% | Pixel-F1 = {f1_tp:.4f}     -> {verdict_tp}"
         )
 
 
@@ -204,7 +204,7 @@ def main() -> None:
     in_channels = 11 if args.use_forensic_maps else 3
     amp_enabled = bool(args.amp and device.type == "cuda")
 
-    # 1. Fast 3-second --dry-run mode
+    # 1. Fast 3-second --dry-run mode (NEVER writes to best_model.pth!)
     if args.dry_run:
         t0 = time.perf_counter()
         print("=" * 72)
@@ -240,32 +240,33 @@ def main() -> None:
         scaler.update()
 
         os.makedirs(args.save_dir, exist_ok=True)
-        dry_ckpt_path = os.path.join(args.save_dir, "best_model.pth")
-        if not os.path.exists(dry_ckpt_path):
-            torch.save(
-                {
-                    "epoch": 0,
-                    "round_id": 0,
-                    "arch": "DWTMobileUNet",
-                    "in_channels": in_channels,
-                    "width_multiplier": 0.5,
-                    "best_score": 0.0,
-                    "model_state_dict": model.state_dict(),
-                },
-                dry_ckpt_path,
-            )
+        dry_ckpt_path = os.path.join(args.save_dir, "dry_run.pth")
+        torch.save(
+            {
+                "epoch": 0,
+                "round_id": 0,
+                "dry_run": True,
+                "arch": "DWTMobileUNet",
+                "in_channels": in_channels,
+                "width_multiplier": 0.5,
+                "best_score": 0.0,
+                "model_state_dict": model.state_dict(),
+            },
+            dry_ckpt_path,
+        )
         dt = time.perf_counter() - t0
         print(
             f"[DRY-RUN] Thành công trong {dt:.2f}s! Loss={loss_info['loss_total']:.4f} "
-            f"(BCE={loss_info['loss_bce_cls']:.4f}, Dice={loss_info['loss_dice']:.4f}, Focal={loss_info['loss_focal']:.4f})"
+            f"(Lưu file kiểm thử riêng tại: {dry_ckpt_path}, KHÔNG ghi đè best_model.pth)"
         )
         print("=" * 72)
         sys.exit(0)
 
-    # 2. Load Dataset with Stratified Split & Hybrid Crop+Resize Forensic Augmentations
+    # 2. Load Dataset with Leak-Free Group-Aware Stratified Split & Mask Validation
     os.makedirs(args.save_dir, exist_ok=True)
     train_loader, val_loader, stats = build_dataloaders(
         data_dir=args.data_dir,
+        val_dir=args.val_dir,
         img_size=192,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -276,7 +277,8 @@ def main() -> None:
     )
     print(
         f"[DATASET] Tổng mẫu hợp lệ: {stats['total']} (Train={stats['train']}, Val={stats['val']}) | "
-        f"Au={stats['authentic']} | Tp (có Mask)={stats['tampered']} | "
+        f"Au={stats['authentic']} | Tp (Mask hợp lệ)={stats['tampered']} | "
+        f"Loại bỏ Tp thiếu/lỗi Mask={stats['skipped_unmatched_tp'] + stats['corrupted_or_empty_masks']} | "
         f"Hybrid Native-Crop Prob={args.native_crop_prob*100:.0f}%"
     )
 
@@ -312,17 +314,20 @@ def main() -> None:
         print(f"🔄 Phát hiện checkpoint tại: {ckpt_to_load}. Đang kiểm tra tương thích...")
         try:
             raw_ckpt = torch.load(ckpt_to_load, map_location=device)
-            sd = (
-                raw_ckpt.get("model_state_dict", raw_ckpt)
-                if isinstance(raw_ckpt, dict)
-                else raw_ckpt
-            )
-            model.load_state_dict(sd, strict=True)
-            if isinstance(raw_ckpt, dict):
-                best_score = float(raw_ckpt.get("best_score", 0.0))
-            print(
-                f"✅ Nạp trọng số DWTMobileUNet thành công (Global best_score={best_score:.4f})!"
-            )
+            if isinstance(raw_ckpt, dict) and raw_ckpt.get("dry_run", False):
+                print("⚠️ Bỏ qua checkpoint được sinh từ --dry-run (trọng số ngẫu nhiên). Sẽ train từ đầu!")
+            else:
+                sd = (
+                    raw_ckpt.get("model_state_dict", raw_ckpt)
+                    if isinstance(raw_ckpt, dict)
+                    else raw_ckpt
+                )
+                model.load_state_dict(sd, strict=True)
+                if isinstance(raw_ckpt, dict):
+                    best_score = float(raw_ckpt.get("best_score", 0.0))
+                print(
+                    f"✅ Nạp trọng số DWTMobileUNet thành công (Global best_score={best_score:.4f})!"
+                )
         except Exception as e:
             print(
                 f"ℹ️ Checkpoint cũ thuộc kiến trúc trước ({type(e).__name__}). "
@@ -338,7 +343,6 @@ def main() -> None:
         current_round = start_round + r_offset
         round_lr = args.lr * (args.round_lr_decay ** r_offset)
 
-        # If starting subsequent round in multi-round mode, reload best_model.pth from previous round
         if r_offset > 0 and os.path.exists(best_model_path):
             best_ckpt = torch.load(best_model_path, map_location=device)
             model.load_state_dict(best_ckpt["model_state_dict"], strict=True)
@@ -410,12 +414,12 @@ def main() -> None:
                     probs_cls = torch.sigmoid(logits_cls)
                     probs_mask = torch.sigmoid(logits_mask)
 
-                    preds_cls = (probs_cls > 0.5).float()
+                    preds_cls = (probs_cls >= 0.5).float()
                     val_cls_correct += (preds_cls == labels).sum().item()
                     val_total += labels.size(0)
 
-                    pred_bin = (probs_mask > 0.5).float()
-                    true_bin = (masks > 0.5).float()
+                    pred_bin = (probs_mask >= 0.5).float()
+                    true_bin = (masks >= 0.5).float()
 
                     tp_idx = labels.view(-1) > 0.5
                     if tp_idx.any():
@@ -458,6 +462,7 @@ def main() -> None:
             ckpt_payload = {
                 "round_id": current_round,
                 "epoch": epoch,
+                "dry_run": False,
                 "arch": "DWTMobileUNet",
                 "in_channels": in_channels,
                 "width_multiplier": 0.5,
@@ -498,7 +503,6 @@ def main() -> None:
             with open(history_path, "w", encoding="utf-8") as f:
                 json.dump(history, f, indent=2)
 
-        # End of Round Sanity Check on real Val samples
         run_real_sanity_check(model, val_loader, device)
         print(
             f"✅ Hoàn tất Round {current_round}! Round Best: {round_best_score:.4f} | Global Best: {best_score:.4f} -> {best_model_path}"

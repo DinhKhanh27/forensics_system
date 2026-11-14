@@ -1,23 +1,14 @@
 """
-RAM-Aware Auto-Tiling, Sliding Window Inference & Global-Local Context Fusion Engine
+RAM-Aware Auto-Tiling, Sliding Window Inference & Calibrated Output Engine
 for Raspberry Pi 3 Model B (1 GB RAM).
 
-Supported Modes (--mode):
-1. 'fast':
-   Directly resizes input image to 192x192, runs a single pass (~0.7s on RPi 3),
-   and upsamples the predicted mask back to original resolution.
-2. 'tile' (Sliding Window + Global-Local Context Fusion):
-   - First runs 1 global context pass (`fast` 192x192) to capture scene-level illumination
-     and prevent isolated texture patches from triggering false alarms.
-   - Splits high-resolution image into 192x192 patches with stride=160 (strictly divisible
-     by 8 to preserve the 8x8 JPEG compression block phase; overlap=32 px).
-   - Processes patches sequentially, invoking gc.collect() immediately after each patch
-     to lock peak model RAM under 60 MB.
-   - Blends overlapping patch masks using a 2D Gaussian weight window and fuses the local
-     high-resolution mask with the global context mask (`0.65 * M_tile + 0.35 * M_global`).
-3. 'auto' (Default):
-   Automatically selects 'fast' if max(H, W) <= 384 (e.g., CASIA dataset), or switches
-   to 'tile' if max(H, W) > 384 (e.g., camera/smartphone photos).
+Fixes Addressing Code Review:
+1. Transparent Separation of `model_probability`, `combined_score`, and `decision_rule`:
+   - `model_prob_cls` (`p_fake` displayed as model probability) is the direct calibrated
+     Sigmoid probability from Head 1 (`prob_cls` in 'fast' mode, or `max(prob_cls_patch)`
+     in 'tile' mode) and is NEVER mutated post-threshold!
+   - `mask_score` and `num_contours` represent Head 2 localization evidence.
+   - `combined_score` and `decision_rule` explicitly document how the final verdict is reached.
 """
 
 import gc
@@ -116,8 +107,9 @@ def draw_forgery_contours(
 
 class TilingInferenceEngine:
     """
-    Unified Inference Controller supporting 'fast', 'tile', and 'auto' modes with
-    Global-Local Context Fusion and strict RAM management (< 60 MB model peak RAM).
+    Unified Inference Controller supporting 'fast', 'tile', and 'auto' modes.
+    Preserves un-mutated `model_probability` (Head 1 Sigmoid output) alongside
+    `mask_peak_prob` (Head 2) and `combined_score`.
     """
 
     def __init__(
@@ -159,15 +151,20 @@ class TilingInferenceEngine:
         active_mode = self.resolve_mode(mode, orig_h, orig_w)
 
         if active_mode == "fast":
-            p_fake, full_prob_mask = self._run_fast(rgb_img, patch_predict_fn)
+            model_prob_cls, full_prob_mask = self._run_fast(rgb_img, patch_predict_fn)
             num_patches = 1
         else:
-            p_fake, full_prob_mask, num_patches = self._run_sliding_window(
+            model_prob_cls, full_prob_mask, num_patches = self._run_sliding_window(
                 rgb_img, patch_predict_fn
             )
 
-        is_forged = bool(p_fake >= decision_t)
+        # Pure Head-1 probability is kept strictly intact (never mutated post-hoc)
+        model_prob_cls = float(np.clip(model_prob_cls, 0.0, 1.0))
+        mask_peak_prob = float(np.percentile(full_prob_mask, 99.0))
+        combined_score = float(0.70 * model_prob_cls + 0.30 * mask_peak_prob)
 
+        # First pass contour extraction at decision_t
+        is_forged = bool(model_prob_cls >= decision_t)
         annotated_img, binary_mask, heatmap_img, num_contours = draw_forgery_contours(
             rgb_img,
             full_prob_mask,
@@ -175,14 +172,16 @@ class TilingInferenceEngine:
             draw_boxes=is_forged,
         )
 
-        if is_forged and num_contours == 0 and p_fake < (decision_t + 0.15):
-            p_fake = float(max(0.0, decision_t - 0.05))
-            is_forged = False
-
+        decision_rule = f"model_prob_cls ({model_prob_cls:.4f}) >= T ({decision_t:.2f})"
         label = "ẢNH GIẢ (FORGED)" if is_forged else "ẢNH THẬT (AUTHENTIC)"
 
         return {
-            "p_fake": float(np.clip(p_fake, 0.0, 1.0)),
+            "p_fake": model_prob_cls,                # Direct calibrated Head-1 probability
+            "model_probability": model_prob_cls,     # Explicit alias for academic reporting
+            "mask_peak_prob": mask_peak_prob,        # Head-2 99th-percentile mask probability
+            "combined_score": combined_score,        # Separate composite score (0.7*Cls + 0.3*Mask)
+            "num_contours": int(num_contours),
+            "decision_rule": decision_rule,
             "is_forged": is_forged,
             "label": label,
             "mode_used": active_mode,
@@ -211,7 +210,7 @@ class TilingInferenceEngine:
                 dtype=np.uint8,
             )
 
-        p_fake, patch_mask = patch_predict_fn(resized_patch)
+        p_cls, patch_mask = patch_predict_fn(resized_patch)
         patch_mask_2d = np.clip(np.squeeze(patch_mask).astype(np.float32), 0.0, 1.0)
 
         if orig_h == self.patch_size and orig_w == self.patch_size:
@@ -230,7 +229,7 @@ class TilingInferenceEngine:
 
         del resized_patch, patch_mask, patch_mask_2d
         gc.collect()
-        return float(np.clip(p_fake, 0.0, 1.0)), full_mask
+        return float(np.clip(p_cls, 0.0, 1.0)), full_mask
 
     def _run_sliding_window(
         self,
@@ -240,14 +239,13 @@ class TilingInferenceEngine:
         """
         Sequential sliding-window inference with stride=160 (overlap=32px),
         Gaussian Blending accumulation, Global-Local Context Fusion, and per-patch gc.collect().
+        Returns pure `max(P_patch)` (or global-weighted Head 1 probability) without post-hoc mutation.
         """
         orig_h, orig_w = rgb_img.shape[:2]
         ps = self.patch_size
 
-        # 1. Global overview pass (captures full-image context so homogeneous background patches stay clean)
         p_global, global_mask = self._run_fast(rgb_img, patch_predict_fn)
 
-        # 2. Local native-resolution sliding window pass
         pad_h = max(0, ps - orig_h)
         pad_w = max(0, ps - orig_w)
         if pad_h > 0 or pad_w > 0:
@@ -264,18 +262,18 @@ class TilingInferenceEngine:
         mask_accumulator = np.zeros((work_h, work_w), dtype=np.float32)
         weight_accumulator = np.zeros((work_h, work_w), dtype=np.float32)
 
-        patch_scores: List[float] = []
+        patch_cls_probs: List[float] = []
         num_patches = 0
 
         for y in y_coords:
             for x in x_coords:
                 patch_rgb = work_img[y : y + ps, x : x + ps]
-                p_patch, patch_mask = patch_predict_fn(patch_rgb)
+                p_patch_cls, patch_mask = patch_predict_fn(patch_rgb)
                 patch_mask_2d = np.clip(
                     np.squeeze(patch_mask).astype(np.float32), 0.0, 1.0
                 )
 
-                patch_scores.append(float(np.clip(p_patch, 0.0, 1.0)))
+                patch_cls_probs.append(float(np.clip(p_patch_cls, 0.0, 1.0)))
 
                 mask_accumulator[y : y + ps, x : x + ps] += (
                     patch_mask_2d * self.gaussian_weight
@@ -289,14 +287,11 @@ class TilingInferenceEngine:
         blended_local = mask_accumulator / np.maximum(weight_accumulator, 1e-6)
         local_mask = np.clip(blended_local[:orig_h, :orig_w], 0.0, 1.0)
 
-        # Fuse High-Res Local Tile Mask (65%) with Global Context Mask (35%)
         fused_mask = np.clip(0.65 * local_mask + 0.35 * global_mask, 0.0, 1.0)
+        max_p_patch = max(patch_cls_probs) if patch_cls_probs else p_global
 
-        max_p_patch = max(patch_scores) if patch_scores else 0.0
-        fused_peak = float(np.percentile(fused_mask, 99.5))
-        global_p_fake = 0.40 * p_global + 0.35 * max_p_patch + 0.25 * fused_peak
-
+        # Pure Head-1 probability across global & local patches: max(P_patch) as specified in Section 3
         del mask_accumulator, weight_accumulator, blended_local, local_mask, global_mask
         gc.collect()
 
-        return float(np.clip(global_p_fake, 0.0, 1.0)), fused_mask, num_patches
+        return float(max_p_patch), fused_mask, num_patches

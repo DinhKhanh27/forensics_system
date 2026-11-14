@@ -1,16 +1,16 @@
 """
 Cross-Platform Embedded Inference Engine (Google Colab, PC, and Raspberry Pi 3 Model B).
 
-Fixes & Improvements after Experimental Review:
-1. Automatic Sigmoid Calibration Guard (`_ensure_probability`):
-   - If an exported ONNX or PyTorch checkpoint outputs raw logits (e.g., values < 0 or > 1
-     from commit 8d0513a), automatically applies `sigmoid(x) = 1 / (1 + exp(-x))` so
-     `p_fake` and `mask_2d` are strictly valid probabilities in [0, 1].
-2. Automatic Input Channel Matching:
-   - Inspects the ONNX or PyTorch model's expected input channel dimension (`3`, `9`, or `11`)
-     and feeds either normalized 3-channel RGB `[0, 1]` (when 2-Level Haar DWT is inside the
-     graph) or the 9/11-channel `MRAPreprocessor` tensor.
-3. Universal `.pth` checkpoint loading (`DWTMobileUNet` and `LegacyDWTUNet`).
+Fixes Addressing Code Review:
+1. Fail-Fast Model Loading:
+   - Raises a clear `FileNotFoundError` when no trained `.onnx` or `.pth` model is found,
+     instead of silently falling back to an uncalibrated heuristic MRA mode.
+   - Demo heuristic mode is only activated if `--allow-heuristic-demo` (`allow_heuristic_demo=True`)
+     is explicitly requested.
+2. Direct Calibrated Model Probability (`p_fake` / `model_probability`):
+   - `_predict_single_patch` returns the pure calibrated Head-1 Sigmoid probability `p_cls`
+     without mixing it with mask percentiles, keeping inference probabilities 100% consistent
+     with validation calibration.
 """
 
 import argparse
@@ -67,10 +67,6 @@ def _sigmoid_np(x: np.ndarray) -> np.ndarray:
 
 
 def _ensure_probability(arr: np.ndarray) -> np.ndarray:
-    """
-    Converts raw model output to probabilities in [0, 1] if the model returned raw logits
-    (i.e. values < -1e-4 or > 1.0 + 1e-4).
-    """
     arr_f32 = np.asarray(arr, dtype=np.float32)
     if float(np.min(arr_f32)) < -1e-4 or float(np.max(arr_f32)) > 1.0001:
         return _sigmoid_np(arr_f32)
@@ -80,6 +76,7 @@ def _ensure_probability(arr: np.ndarray) -> np.ndarray:
 class EmbeddedForensicPredictor:
     """
     High-efficiency inference wrapper for DWT-MobileUNet (INT8 ONNX or PyTorch checkpoint).
+    Fails fast if no model file is found unless `allow_heuristic_demo=True` is explicitly set.
     """
 
     def __init__(
@@ -91,14 +88,16 @@ class EmbeddedForensicPredictor:
         auto_tile_threshold: int = 384,
         threshold: float = 0.5,
         num_threads: int = 4,
+        allow_heuristic_demo: bool = False,
     ) -> None:
         self.patch_size = patch_size
         self.stride = stride
         self.auto_tile_threshold = auto_tile_threshold
         self.threshold = threshold
         self.use_forensic_maps = use_forensic_maps
+        self.allow_heuristic_demo = allow_heuristic_demo
         self.expected_in_channels = 11 if use_forensic_maps else 3
-        self.backend = "heuristic_mra"
+        self.backend = "uninitialized"
         self.session = None
         self.torch_model = None
         self.input_name = "mra_input"
@@ -144,6 +143,15 @@ class EmbeddedForensicPredictor:
         elif resolved_path is not None and resolved_path.suffix.lower() == ".pth" and _HAS_TORCH:
             from src.model import load_forensic_checkpoint
 
+            raw_ckpt = torch.load(resolved_path, map_location="cpu")
+            if (
+                isinstance(raw_ckpt, dict)
+                and raw_ckpt.get("dry_run", False)
+                and not allow_heuristic_demo
+            ):
+                raise RuntimeError(
+                    f"❌ LỖI: Checkpoint '{resolved_path}' là file kiểm thử --dry-run (chưa huấn luyện)!"
+                )
             self.torch_model, self.expected_in_channels, arch_name = (
                 load_forensic_checkpoint(
                     str(resolved_path),
@@ -155,6 +163,13 @@ class EmbeddedForensicPredictor:
             self.torch_model.eval()
             self.use_forensic_maps = self.expected_in_channels == 11
             self.backend = f"PyTorch ({resolved_path.name} - {arch_name})"
+        else:
+            if not allow_heuristic_demo:
+                raise FileNotFoundError(
+                    f"❌ LỖI: Không tìm thấy mô hình suy luận tại '{model_path}' (hoặc trong thư mục checkpoints/). "
+                    "Hãy chạy train.py & export_quantize.py trước, hoặc truyền cờ --allow-heuristic-demo nếu chỉ muốn chạy chế độ demo giải tích MRA."
+                )
+            self.backend = "DEMO_HEURISTIC_MRA (Untrained)"
 
         self.mra = MRAPreprocessor(
             target_size=(patch_size, patch_size),
@@ -168,11 +183,6 @@ class EmbeddedForensicPredictor:
         )
 
     def _prepare_input_tensor(self, patch_rgb: np.ndarray) -> np.ndarray:
-        """
-        Prepares `(1, C, 192, 192)` float32 tensor matching `self.expected_in_channels`.
-        - If model expects 3 channels (in-graph 2-Level Haar DWT): returns RGB in [0, 1].
-        - If model expects 9 or 11 channels: returns CPU `MRAPreprocessor` tensor.
-        """
         if self.expected_in_channels == 3:
             img_float = patch_rgb.astype(np.float32) / 255.0
             rgb_chw = np.transpose(img_float, (2, 0, 1))
@@ -182,8 +192,8 @@ class EmbeddedForensicPredictor:
 
     def _predict_single_patch(self, patch_rgb: np.ndarray) -> Tuple[float, np.ndarray]:
         """
-        Runs model inference on a single 192x192 RGB patch and guarantees calibrated
-        probabilities in [0, 1] for both `p_fake` and `mask_2d`.
+        Runs model inference on a single 192x192 RGB patch and returns the direct,
+        un-mixed Head-1 Sigmoid probability `p_cls` in [0, 1] and Head-2 `mask_2d` in [0, 1].
         """
         if self.session is not None or self.torch_model is not None:
             batched = self._prepare_input_tensor(patch_rgb)
@@ -197,25 +207,14 @@ class EmbeddedForensicPredictor:
                     raw_cls = pt_cls.cpu().numpy()
                     raw_mask = pt_mask.cpu().numpy()
 
-            # Automatically convert raw logits -> Sigmoid probabilities if needed
             prob_cls_arr = _ensure_probability(raw_cls)
             mask_2d = np.squeeze(_ensure_probability(raw_mask)).astype(np.float32)
             p_cls = float(np.squeeze(prob_cls_arr))
 
-            # Suppress tiny isolated background probabilities when classification head says Authentic
-            # and couple patch forgery score with actual spatial mask presence
-            forged_area_ratio = float(np.mean(mask_2d >= 0.5))
-            if forged_area_ratio < 0.002 and p_cls < 0.65:
-                # Less than 0.2% pixels active (< 75 pixels in 192x192) -> suppress false-positive noise
-                mask_2d = mask_2d * 0.5
-                p_fake = min(p_cls, float(np.percentile(mask_2d, 99)))
-            else:
-                p_fake = float(0.65 * p_cls + 0.35 * float(np.percentile(mask_2d, 98)))
-
             del batched
-            return p_fake, mask_2d
+            return p_cls, mask_2d
 
-        # Heuristic MRA fallback when no model file exists yet
+        # Explicit demo fallback (only reachable when allow_heuristic_demo=True)
         mra_tensor = self.mra(patch_rgb)
         hf_energy = np.mean(np.abs(mra_tensor[3:9]), axis=0)
         norm_e = (hf_energy - hf_energy.min()) / (
@@ -264,8 +263,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--image",
         type=str,
-        default=None,
-        help="Path to input image (if omitted, runs on a synthetic test image)",
+        required=True,
+        help="Path to input image file",
     )
     parser.add_argument(
         "--model",
@@ -292,6 +291,11 @@ def parse_args() -> argparse.Namespace:
         help="Enable explicit Donoho MAD + ELA channels (11 channels)",
     )
     parser.add_argument(
+        "--allow-heuristic-demo",
+        action="store_true",
+        help="Explicitly allow running uncalibrated MRA heuristic demo when no trained model exists",
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default="outputs",
@@ -303,20 +307,18 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    if not os.path.isfile(args.image):
+        raise FileNotFoundError(f"❌ Không tìm thấy file ảnh đầu vào: {args.image}")
+
     predictor = EmbeddedForensicPredictor(
         model_path=args.model,
         use_forensic_maps=args.use_forensic_maps,
         threshold=args.threshold,
+        allow_heuristic_demo=args.allow_heuristic_demo,
     )
 
-    if args.image and os.path.isfile(args.image):
-        rgb_img = np.array(Image.open(args.image).convert("RGB"), dtype=np.uint8)
-        img_name = Path(args.image).stem
-    else:
-        print("[INFERENCE] No --image provided; generating synthetic 640x480 test image...")
-        rgb_img = np.random.randint(40, 200, size=(480, 640, 3), dtype=np.uint8)
-        rgb_img[140:300, 200:420] = np.clip(rgb_img[140:300, 200:420] + 55, 0, 255)
-        img_name = "synthetic_test"
+    rgb_img = np.array(Image.open(args.image).convert("RGB"), dtype=np.uint8)
+    img_name = Path(args.image).stem
 
     res = predictor.predict_image(
         rgb_img, mode=args.mode, threshold=args.threshold, include_mra_vis=False
@@ -339,9 +341,9 @@ def main() -> None:
     print(
         f"  Execution Mode     : {res['mode_used'].upper()} (Patches evaluated: {res['num_patches']})"
     )
-    print(f"  Verdict            : {res['label']}")
+    print(f"  Verdict            : {res['label']} (Rule: {res['decision_rule']})")
     print(
-        f"  Probability P_fake : {res['p_fake'] * 100:.2f}% (Threshold T = {args.threshold:.2f})"
+        f"  Model Prob (Head 1): {res['model_probability'] * 100:.2f}% | Mask Peak (Head 2): {res['mask_peak_prob'] * 100:.2f}% | Combined: {res['combined_score'] * 100:.2f}%"
     )
     print(
         f"  Processing Latency : {res['latency_ms']:.1f} ms ({res['latency_s']:.3f} s)"
