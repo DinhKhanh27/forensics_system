@@ -1,17 +1,16 @@
 """
 Cross-Platform Embedded Inference Engine (Google Colab, PC, and Raspberry Pi 3 Model B).
 
-Key Features:
-1. Supports ONNX Runtime INT8/FP32 (.onnx) with zero PyTorch dependency on Raspberry Pi 3,
-   plus automatic fallback to PyTorch (.pth) or heuristic MRA forensic mode if no model
-   file is present yet during initial bring-up.
-2. Three Inference Modes (--mode):
-   - 'fast': Direct resize to 192x192 (~0.7s/image on RPi 3).
-   - 'tile': Sliding window 192x192 with stride=160 (divisible by 8, overlap=32px),
-             Gaussian Blending, P_fake = max(P_patch), and per-patch gc.collect()
-             to lock model peak RAM < 60 MB.
-   - 'auto': Runs 'fast' if max(H, W) <= 384, else switches to 'tile'.
-3. Real-time RAM footprint monitoring (MB) and execution latency profiling (ms / s).
+Fixes & Improvements after Experimental Review:
+1. Automatic Sigmoid Calibration Guard (`_ensure_probability`):
+   - If an exported ONNX or PyTorch checkpoint outputs raw logits (e.g., values < 0 or > 1
+     from commit 8d0513a), automatically applies `sigmoid(x) = 1 / (1 + exp(-x))` so
+     `p_fake` and `mask_2d` are strictly valid probabilities in [0, 1].
+2. Automatic Input Channel Matching:
+   - Inspects the ONNX or PyTorch model's expected input channel dimension (`3`, `9`, or `11`)
+     and feeds either normalized 3-channel RGB `[0, 1]` (when 2-Level Haar DWT is inside the
+     graph) or the 9/11-channel `MRAPreprocessor` tensor.
+3. Universal `.pth` checkpoint loading (`DWTMobileUNet` and `LegacyDWTUNet`).
 """
 
 import argparse
@@ -49,15 +48,10 @@ except ImportError:
 
 
 def get_process_ram_mb() -> float:
-    """
-    Returns current resident set size (RSS) RAM usage of the Python process in MB.
-    Works across Linux (Raspberry Pi OS / Colab) and Windows.
-    """
     if _HAS_PSUTIL:
         proc = psutil.Process(os.getpid())
         return float(proc.memory_info().rss) / (1024.0 * 1024.0)
 
-    # Linux /proc/self/status fallback on Raspberry Pi OS
     status_file = Path("/proc/self/status")
     if status_file.exists():
         for line in status_file.read_text(encoding="utf-8").splitlines():
@@ -65,6 +59,22 @@ def get_process_ram_mb() -> float:
                 kb = float(line.split()[1])
                 return kb / 1024.0
     return 0.0
+
+
+def _sigmoid_np(x: np.ndarray) -> np.ndarray:
+    x_clipped = np.clip(x.astype(np.float32), -30.0, 30.0)
+    return 1.0 / (1.0 + np.exp(-x_clipped))
+
+
+def _ensure_probability(arr: np.ndarray) -> np.ndarray:
+    """
+    Converts raw model output to probabilities in [0, 1] if the model returned raw logits
+    (i.e. values < -1e-4 or > 1.0 + 1e-4).
+    """
+    arr_f32 = np.asarray(arr, dtype=np.float32)
+    if float(np.min(arr_f32)) < -1e-4 or float(np.max(arr_f32)) > 1.0001:
+        return _sigmoid_np(arr_f32)
+    return np.clip(arr_f32, 0.0, 1.0)
 
 
 class EmbeddedForensicPredictor:
@@ -87,12 +97,12 @@ class EmbeddedForensicPredictor:
         self.auto_tile_threshold = auto_tile_threshold
         self.threshold = threshold
         self.use_forensic_maps = use_forensic_maps
+        self.expected_in_channels = 11 if use_forensic_maps else 3
         self.backend = "heuristic_mra"
         self.session = None
         self.torch_model = None
         self.input_name = "mra_input"
 
-        # Auto-resolve model file priority: specified path -> model_int8.onnx -> model_fp32.onnx -> best_model.pth
         candidates = []
         if model_path:
             candidates.append(Path(model_path))
@@ -115,7 +125,7 @@ class EmbeddedForensicPredictor:
             sess_opts.intra_op_num_threads = num_threads
             sess_opts.inter_op_num_threads = 1
             sess_opts.enable_mem_pattern = False
-            sess_opts.enable_cpu_mem_arena = False  # Prevents arena bloat on 1GB RPi 3
+            sess_opts.enable_cpu_mem_arena = False
             sess_opts.graph_optimization_level = (
                 ort.GraphOptimizationLevel.ORT_ENABLE_ALL
             )
@@ -127,20 +137,24 @@ class EmbeddedForensicPredictor:
             inp_meta = self.session.get_inputs()[0]
             self.input_name = inp_meta.name
             if len(inp_meta.shape) >= 2 and isinstance(inp_meta.shape[1], int):
-                self.use_forensic_maps = inp_meta.shape[1] == 11
-            self.backend = f"ONNX ({resolved_path.name})"
+                self.expected_in_channels = int(inp_meta.shape[1])
+                self.use_forensic_maps = self.expected_in_channels == 11
+            self.backend = f"ONNX ({resolved_path.name}, in_ch={self.expected_in_channels})"
 
         elif resolved_path is not None and resolved_path.suffix.lower() == ".pth" and _HAS_TORCH:
-            from src.model import DWTMobileUNet
+            from src.model import load_forensic_checkpoint
 
-            ckpt = torch.load(resolved_path, map_location="cpu")
-            in_ch = ckpt.get("in_channels", 11 if self.use_forensic_maps else 9)
-            w_mult = ckpt.get("width_multiplier", 0.5)
-            self.use_forensic_maps = in_ch == 11
-            self.torch_model = DWTMobileUNet(in_channels=in_ch, width_multiplier=w_mult)
-            self.torch_model.load_state_dict(ckpt.get("model_state_dict", ckpt), strict=True)
+            self.torch_model, self.expected_in_channels, arch_name = (
+                load_forensic_checkpoint(
+                    str(resolved_path),
+                    device="cpu",
+                    return_logits=False,
+                    default_in_channels=self.expected_in_channels,
+                )
+            )
             self.torch_model.eval()
-            self.backend = f"PyTorch ({resolved_path.name})"
+            self.use_forensic_maps = self.expected_in_channels == 11
+            self.backend = f"PyTorch ({resolved_path.name} - {arch_name})"
 
         self.mra = MRAPreprocessor(
             target_size=(patch_size, patch_size),
@@ -153,31 +167,63 @@ class EmbeddedForensicPredictor:
             threshold=threshold,
         )
 
+    def _prepare_input_tensor(self, patch_rgb: np.ndarray) -> np.ndarray:
+        """
+        Prepares `(1, C, 192, 192)` float32 tensor matching `self.expected_in_channels`.
+        - If model expects 3 channels (in-graph 2-Level Haar DWT): returns RGB in [0, 1].
+        - If model expects 9 or 11 channels: returns CPU `MRAPreprocessor` tensor.
+        """
+        if self.expected_in_channels == 3:
+            img_float = patch_rgb.astype(np.float32) / 255.0
+            rgb_chw = np.transpose(img_float, (2, 0, 1))
+            return np.expand_dims(rgb_chw, axis=0)
+        mra_chw = self.mra(patch_rgb)
+        return np.expand_dims(mra_chw, axis=0)
+
     def _predict_single_patch(self, patch_rgb: np.ndarray) -> Tuple[float, np.ndarray]:
         """
-        Runs 2-Level Haar DWT MRA + Model inference on a single 192x192 RGB patch.
+        Runs model inference on a single 192x192 RGB patch and guarantees calibrated
+        probabilities in [0, 1] for both `p_fake` and `mask_2d`.
         """
-        mra_tensor = self.mra(patch_rgb)  # (C, 192, 192)
-        batched = np.expand_dims(mra_tensor, axis=0)  # (1, C, 192, 192)
+        if self.session is not None or self.torch_model is not None:
+            batched = self._prepare_input_tensor(patch_rgb)
 
-        if self.session is not None:
-            ort_cls, ort_mask = self.session.run(None, {self.input_name: batched})
-            p_fake = float(np.squeeze(ort_cls))
-            mask_2d = np.squeeze(ort_mask).astype(np.float32)
-        elif self.torch_model is not None:
-            with torch.no_grad():
-                t_in = torch.from_numpy(batched)
-                pt_cls, pt_mask = self.torch_model(t_in)
-                p_fake = float(pt_cls.item())
-                mask_2d = pt_mask.squeeze().cpu().numpy().astype(np.float32)
-        else:
-            # Heuristic MRA fallback when running dry UI test before model export
-            hf_energy = np.mean(np.abs(mra_tensor[3:9]), axis=0)
-            norm_e = (hf_energy - hf_energy.min()) / (hf_energy.max() - hf_energy.min() + 1e-6)
-            mask_2d = np.clip(norm_e, 0.0, 1.0).astype(np.float32)
-            p_fake = float(np.percentile(mask_2d, 95))
+            if self.session is not None:
+                raw_cls, raw_mask = self.session.run(None, {self.input_name: batched})
+            else:
+                with torch.no_grad():
+                    t_in = torch.from_numpy(batched)
+                    pt_cls, pt_mask = self.torch_model(t_in)
+                    raw_cls = pt_cls.cpu().numpy()
+                    raw_mask = pt_mask.cpu().numpy()
 
-        del mra_tensor, batched
+            # Automatically convert raw logits -> Sigmoid probabilities if needed
+            prob_cls_arr = _ensure_probability(raw_cls)
+            mask_2d = np.squeeze(_ensure_probability(raw_mask)).astype(np.float32)
+            p_cls = float(np.squeeze(prob_cls_arr))
+
+            # Suppress tiny isolated background probabilities when classification head says Authentic
+            # and couple patch forgery score with actual spatial mask presence
+            forged_area_ratio = float(np.mean(mask_2d >= 0.5))
+            if forged_area_ratio < 0.002 and p_cls < 0.65:
+                # Less than 0.2% pixels active (< 75 pixels in 192x192) -> suppress false-positive noise
+                mask_2d = mask_2d * 0.5
+                p_fake = min(p_cls, float(np.percentile(mask_2d, 99)))
+            else:
+                p_fake = float(0.65 * p_cls + 0.35 * float(np.percentile(mask_2d, 98)))
+
+            del batched
+            return p_fake, mask_2d
+
+        # Heuristic MRA fallback when no model file exists yet
+        mra_tensor = self.mra(patch_rgb)
+        hf_energy = np.mean(np.abs(mra_tensor[3:9]), axis=0)
+        norm_e = (hf_energy - hf_energy.min()) / (
+            hf_energy.max() - hf_energy.min() + 1e-6
+        )
+        mask_2d = np.clip(norm_e, 0.0, 1.0).astype(np.float32)
+        p_fake = float(np.percentile(mask_2d, 95))
+        del mra_tensor
         return p_fake, mask_2d
 
     def predict_image(
@@ -187,9 +233,6 @@ class EmbeddedForensicPredictor:
         threshold: Optional[float] = None,
         include_mra_vis: bool = True,
     ) -> Dict[str, object]:
-        """
-        Executes full end-to-end forgery detection & localization on an RGB image.
-        """
         gc.collect()
         t_start = time.perf_counter()
 
@@ -293,10 +336,16 @@ def main() -> None:
     print("[EMBEDDED INFERENCE REPORT]")
     print(f"  Backend Engine     : {res['backend']}")
     print(f"  Input Resolution   : {res['resolution']}")
-    print(f"  Execution Mode     : {res['mode_used'].upper()} (Patches evaluated: {res['num_patches']})")
+    print(
+        f"  Execution Mode     : {res['mode_used'].upper()} (Patches evaluated: {res['num_patches']})"
+    )
     print(f"  Verdict            : {res['label']}")
-    print(f"  Probability P_fake : {res['p_fake'] * 100:.2f}% (Threshold T = {args.threshold:.2f})")
-    print(f"  Processing Latency : {res['latency_ms']:.1f} ms ({res['latency_s']:.3f} s)")
+    print(
+        f"  Probability P_fake : {res['p_fake'] * 100:.2f}% (Threshold T = {args.threshold:.2f})"
+    )
+    print(
+        f"  Processing Latency : {res['latency_ms']:.1f} ms ({res['latency_s']:.3f} s)"
+    )
     print(f"  Process RAM Usage  : {res['ram_mb']:.2f} MB")
     print(f"  Saved Outputs      : {annotated_path} | {heatmap_path}")
     print("=" * 72)

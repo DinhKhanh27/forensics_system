@@ -1,14 +1,12 @@
 """
 Model Export & INT8 Quantization Pipeline (PyTorch -> ONNX FP32 -> ONNX INT8).
 
-Target Hardware:
-    Raspberry Pi 3 Model B (ARM Cortex-A53 64-bit, 1 GB RAM)
-    Strict model size budget: < 2.0 MB in INT8.
-
-Usage:
-    python export_quantize.py \
-        --checkpoint checkpoints/best_model.pth \
-        --output_dir checkpoints
+Fixes & Improvements:
+1. Universal Checkpoint Support: Automatically detects and loads either `DWTMobileUNet`
+   (MobileNetV3-Small + 2-Level Haar DWT) or `LegacyDWTUNet` (commit 8d0513a checkpoint)
+   with `return_logits=False` so that `torch.sigmoid` is ALWAYS baked into the exported
+   ONNX graph (`prob_fake` in [0, 1] and `mask_prob` in [0, 1]).
+2. Strict < 2.0 MB INT8 size verification and latency benchmarking.
 """
 
 import argparse
@@ -18,6 +16,7 @@ from pathlib import Path
 from typing import Tuple
 import numpy as np
 import torch
+import torch.nn as nn
 import onnx
 import onnxruntime as ort
 from onnxruntime.quantization import (
@@ -28,25 +27,35 @@ from onnxruntime.quantization import (
     quantize_static,
 )
 
-from src.model import DWTMobileUNet, count_parameters
+from src.model import (
+    DWTMobileUNet,
+    count_parameters,
+    load_forensic_checkpoint,
+)
 
 
 class SyntheticMRADataReader(CalibrationDataReader):
     """
-    Calibration dataset reader generating representative Z-score normalized
-    9-channel (or 11-channel) MRA tensors for static INT8 quantization.
+    Calibration dataset reader generating representative inputs in [0, 1] (for 3-ch RGB)
+    or Z-score normalized (for 9/11-ch MRA) for static INT8 quantization.
     """
 
-    def __init__(self, input_name: str, in_channels: int = 9, num_samples: int = 24) -> None:
+    def __init__(self, input_name: str, in_channels: int = 3, num_samples: int = 24) -> None:
         self.input_name = input_name
         self.in_channels = in_channels
         self.num_samples = num_samples
         self.current_idx = 0
         rng = np.random.default_rng(seed=42)
-        self.samples = [
-            rng.standard_normal(size=(1, in_channels, 192, 192)).astype(np.float32)
-            for _ in range(num_samples)
-        ]
+        if in_channels == 3:
+            self.samples = [
+                rng.uniform(0.0, 1.0, size=(1, 3, 192, 192)).astype(np.float32)
+                for _ in range(num_samples)
+            ]
+        else:
+            self.samples = [
+                rng.standard_normal(size=(1, in_channels, 192, 192)).astype(np.float32)
+                for _ in range(num_samples)
+            ]
 
     def get_next(self) -> dict:
         if self.current_idx >= self.num_samples:
@@ -58,30 +67,30 @@ class SyntheticMRADataReader(CalibrationDataReader):
 
 def load_or_init_pytorch_model(
     checkpoint_path: Path, use_forensic_maps: bool = False
-) -> Tuple[DWTMobileUNet, int]:
+) -> Tuple[nn.Module, int]:
     """
-    Loads trained DWTMobileUNet weights from `checkpoint_path`. If the checkpoint does not
-    exist yet, initializes a clean model so the export pipeline can still be verified.
+    Loads trained weights from `checkpoint_path` with `return_logits=False` (ensuring
+    Sigmoid probabilities in [0, 1] are exported into the ONNX graph).
     """
-    in_channels = 11 if use_forensic_maps else 9
-    width_multiplier = 0.5
+    default_in_ch = 11 if use_forensic_maps else 3
 
-    if checkpoint_path.exists():
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
-        in_channels = ckpt.get("in_channels", in_channels)
-        width_multiplier = ckpt.get("width_multiplier", width_multiplier)
-        model = DWTMobileUNet(
-            in_channels=in_channels, width_multiplier=width_multiplier
+    if checkpoint_path and checkpoint_path.exists():
+        model, in_channels, arch_name = load_forensic_checkpoint(
+            str(checkpoint_path),
+            device="cpu",
+            return_logits=False,
+            default_in_channels=default_in_ch,
         )
-        state_dict = ckpt.get("model_state_dict", ckpt)
-        model.load_state_dict(state_dict, strict=True)
-        print(f"[EXPORT] Loaded trained weights from: {checkpoint_path}")
+        print(
+            f"[EXPORT] Loaded trained '{arch_name}' weights from {checkpoint_path} (in_channels={in_channels}, Sigmoid=ON)"
+        )
     else:
         print(
-            f"[EXPORT] Checkpoint '{checkpoint_path}' not found. Initializing fresh DWT-MobileUNet for export verification."
+            f"[EXPORT] Checkpoint '{checkpoint_path}' not found. Initializing fresh DWTMobileUNet for export verification."
         )
+        in_channels = default_in_ch
         model = DWTMobileUNet(
-            in_channels=in_channels, width_multiplier=width_multiplier
+            in_channels=in_channels, width_multiplier=0.5, return_logits=False
         )
 
     model.eval()
@@ -89,14 +98,14 @@ def load_or_init_pytorch_model(
 
 
 def export_to_onnx(
-    model: DWTMobileUNet, in_channels: int, onnx_fp32_path: Path, opset: int = 13
+    model: nn.Module, in_channels: int, onnx_fp32_path: Path, opset: int = 13
 ) -> None:
     """
-    Exports PyTorch DWT-MobileUNet to ONNX FP32 with dual outputs:
-      - prob_fake: (B, 1)
-      - mask_prob: (B, 1, 192, 192)
+    Exports PyTorch model to ONNX FP32 with calibrated Sigmoid outputs:
+      - prob_fake: (B, 1) in [0, 1]
+      - mask_prob: (B, 1, 192, 192) in [0, 1]
     """
-    dummy_input = torch.randn(1, in_channels, 192, 192, dtype=torch.float32)
+    dummy_input = torch.rand(1, in_channels, 192, 192, dtype=torch.float32)
     torch.onnx.export(
         model,
         dummy_input,
@@ -119,12 +128,9 @@ def export_to_onnx(
 def quantize_onnx_int8(
     onnx_fp32_path: Path,
     onnx_int8_path: Path,
-    in_channels: int = 9,
+    in_channels: int = 3,
     quant_mode: str = "dynamic",
 ) -> None:
-    """
-    Quantizes ONNX FP32 model to 8-bit integer (INT8 / QUInt8) for ARM Cortex-A53 CPU.
-    """
     if quant_mode == "static":
         reader = SyntheticMRADataReader(
             input_name="mra_input", in_channels=in_channels, num_samples=24
@@ -147,16 +153,14 @@ def quantize_onnx_int8(
 
 
 def benchmark_and_verify(
-    torch_model: DWTMobileUNet,
+    torch_model: nn.Module,
     onnx_fp32_path: Path,
     onnx_int8_path: Path,
-    in_channels: int = 9,
+    in_channels: int = 3,
 ) -> None:
-    """
-    Verifies output tensor shapes, numerical consistency, file sizes (< 2 MB requirement),
-    and single-patch CPU inference latency.
-    """
-    dummy_np = np.random.randn(1, in_channels, 192, 192).astype(np.float32)
+    dummy_np = np.random.uniform(0.0, 1.0, size=(1, in_channels, 192, 192)).astype(
+        np.float32
+    )
 
     with torch.no_grad():
         pt_cls, pt_mask = torch_model(torch.from_numpy(dummy_np))
@@ -177,7 +181,6 @@ def benchmark_and_verify(
     ort_fp32_cls, ort_fp32_mask = sess_fp32.run(None, {"mra_input": dummy_np})
     ort_int8_cls, ort_int8_mask = sess_int8.run(None, {"mra_input": dummy_np})
 
-    # Measure INT8 latency over 10 runs
     t0 = time.perf_counter()
     for _ in range(10):
         sess_int8.run(None, {"mra_input": dummy_np})
@@ -195,8 +198,12 @@ def benchmark_and_verify(
     print(
         f"  ONNX INT8 Model Size : {int8_mb:.3f} MB ({onnx_int8_path}) -> Target < 2.0 MB: {'PASS' if int8_mb < 2.0 else 'WARN'}"
     )
-    print(f"  Output 1 (prob_fake) : shape={ort_int8_cls.shape}, max_abs_diff={cls_diff:.5f}")
-    print(f"  Output 2 (mask_prob) : shape={ort_int8_mask.shape}, max_abs_diff={mask_diff:.5f}")
+    print(
+        f"  Output 1 (prob_fake) : shape={ort_int8_cls.shape}, range=[{ort_int8_cls.min():.4f}, {ort_int8_cls.max():.4f}], max_diff={cls_diff:.5f}"
+    )
+    print(
+        f"  Output 2 (mask_prob) : shape={ort_int8_mask.shape}, range=[{ort_int8_mask.min():.4f}, {ort_int8_mask.max():.4f}], max_diff={mask_diff:.5f}"
+    )
     print(f"  Avg INT8 CPU Latency : {avg_int8_ms:.2f} ms / patch (192x192)")
     print("=" * 72)
 

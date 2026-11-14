@@ -1,26 +1,21 @@
 """
-Forensic Image Dataset & DataLoader Module (CASIA v2.0, Columbia, NIST16).
+Forensic Image Dataset & Stratified DataLoader Module (CASIA v2.0, Columbia, NIST16).
 
-Expected Directory Structure:
-    data_dir/
-    ├── Au/         # Authentic images (label = 0, ground-truth mask = all zeros)
-    ├── Tp/         # Tampered/Forged images (label = 1)
-    └── Gt_mask/    # Ground-truth binary masks corresponding to Tp images
-                    # (Also auto-detects 'Gt', 'mask', 'masks', 'groundtruth')
-
-Features:
-- Automatic stem matching between tampered images in `Tp/` and masks in `Gt_mask/`
-  (supports suffixes such as `_gt`, `_mask`, or identical stems across extensions).
-- Geometry-preserving forensic augmentations (Random Horizontal/Vertical Flips and
-  90-degree Rotations) applied jointly to RGB image and Ground-Truth mask BEFORE
-  2-Level Haar DWT extraction so subband phase alignment stays authentic.
-- Train/Validation split with deterministic seed and PyTorch DataLoader builder.
+Key Improvements:
+1. Hybrid Multi-Scale Training (50% Native JPEG-Aligned Crop + 50% Full-Image Resize):
+   - Directly solves the Train-Test Domain Gap between 'fast' mode (resized full image) and
+     'tile' mode (192x192 sliding window patches at native resolution).
+   - With 50% probability during training, extracts a native-resolution 192x192 patch aligned
+     to the 8x8 JPEG grid (x0 % 8 == 0, y0 % 8 == 0), guided toward forgery boundaries on Tp
+     images so the 2-Level Haar DWT learns un-interpolated micro-noise and JPEG block artifacts.
+   - With 50% probability, resizes the full image to 192x192 so the model also learns global
+     scene context.
+2. Stratified Train/Validation Split & Joint Geometry-Preserving Augmentations.
 """
 
-import os
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 import numpy as np
 from PIL import Image
 import torch
@@ -28,218 +23,279 @@ from torch.utils.data import Dataset, DataLoader
 
 from src.dwt import MRAPreprocessor
 
-try:
-    import cv2
-    _HAS_CV2 = True
-except ImportError:
-    cv2 = None
-    _HAS_CV2 = False
-
 VALID_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
 
 
-def _list_images(folder: Path) -> List[Path]:
-    if not folder.exists() or not folder.is_dir():
-        return []
-    files = [
-        p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in VALID_IMAGE_EXTS
-    ]
-    files.sort()
-    return files
-
-
-def _build_mask_lookup(mask_dir: Optional[Path]) -> Dict[str, Path]:
+def scan_casia_forensic_dir(root_dir: str) -> Tuple[List[Dict], Dict[str, int]]:
     """
-    Creates a dictionary mapping normalized file stems to ground-truth mask paths.
-    Handles CASIA v2.0 conventions where `Tp_xxx.jpg` matches `Tp_xxx_gt.png`.
+    Recursively scans `root_dir` (using paths relative to `root_dir`) for Authentic (`Au`),
+    Tampered (`Tp`), and Ground-Truth mask files (`Gt_mask`, `CASIA 2 Groundtruth`, `masks`).
     """
-    lookup: Dict[str, Path] = {}
-    if mask_dir is None or not mask_dir.exists():
-        return lookup
+    root_path = Path(root_dir)
+    if not root_path.exists():
+        raise FileNotFoundError(f"Dataset directory does not exist: {root_dir}")
 
-    for mask_path in _list_images(mask_dir):
-        stem_lower = mask_path.stem.lower()
-        lookup[stem_lower] = mask_path
-        for suffix in ("_gt", "_mask", "-gt", "-mask", ".gt"):
-            if stem_lower.endswith(suffix):
-                base_stem = stem_lower[: -len(suffix)]
-                lookup[base_stem] = mask_path
-    return lookup
+    all_files = list(root_path.rglob("*"))
+    au_files: List[Path] = []
+    tp_files: List[Path] = []
+    gt_files: Dict[str, Path] = {}
+
+    exact_gt_names = {"gt", "gt_mask", "mask", "masks", "groundtruth", "ground_truth"}
+    substr_gt_names = ("gt_mask", "groundtruth", "ground_truth", "casia 2 groundtruth", "mask")
+
+    for p in all_files:
+        if not p.is_file() or p.suffix.lower() not in VALID_IMAGE_EXTS:
+            continue
+
+        rel_parts = [part.lower() for part in p.relative_to(root_path).parts[:-1]]
+        is_gt_folder = any(
+            (part in exact_gt_names) or any(gk in part for gk in substr_gt_names)
+            for part in rel_parts
+        )
+
+        if is_gt_folder:
+            stem = p.stem.lower()
+            gt_files[stem] = p
+            for suffix in ("_gt", "_mask", "-gt", "-mask", ".gt"):
+                if stem.endswith(suffix):
+                    gt_files[stem[: -len(suffix)]] = p
+            stem_clean = stem.replace("_gt", "").replace("gt", "").replace("_mask", "")
+            if stem_clean:
+                gt_files[stem_clean] = p
+            continue
+
+        name_lower = p.name.lower()
+        if any(part == "au" or "authentic" in part for part in rel_parts) or name_lower.startswith("au_"):
+            au_files.append(p)
+        elif any(part == "tp" or "tamper" in part or "forged" in part for part in rel_parts) or name_lower.startswith("tp_"):
+            tp_files.append(p)
+
+    au_files.sort()
+    tp_files.sort()
+
+    samples: List[Dict] = []
+    for path in au_files:
+        samples.append({"img_path": str(path), "mask_path": None, "label": 0.0})
+
+    matched_mask_count = 0
+    unmatched_tp = 0
+    for path in tp_files:
+        stem = path.stem.lower()
+        matched_mask_path = None
+        candidates = [
+            stem,
+            stem + "_gt",
+            stem.replace("_tp", "_gt"),
+            stem + "_mask",
+            stem.replace("tp_", "gt_"),
+            stem.replace("_tp", ""),
+            stem.replace("_gt", "").replace("gt", "").replace("_mask", ""),
+        ]
+        for cand in candidates:
+            if cand in gt_files:
+                matched_mask_path = str(gt_files[cand])
+                break
+
+        if matched_mask_path is not None:
+            matched_mask_count += 1
+            samples.append(
+                {"img_path": str(path), "mask_path": matched_mask_path, "label": 1.0}
+            )
+        else:
+            unmatched_tp += 1
+
+    if len(tp_files) > 0 and matched_mask_count == 0:
+        raise RuntimeError(
+            f"❌ LỖI: Tìm thấy {len(tp_files)} ảnh Tp nhưng không khớp được mask nào trong {root_dir}!"
+        )
+
+    stats = {
+        "total": len(samples),
+        "authentic": len(au_files),
+        "tampered": matched_mask_count,
+        "with_mask": matched_mask_count,
+        "skipped_unmatched_tp": unmatched_tp,
+    }
+    return samples, stats
 
 
-def _resolve_dataset_folders(root: Path) -> Tuple[Optional[Path], Optional[Path], Optional[Path]]:
+class CASIADataset(Dataset):
     """
-    Locates Authentic (Au), Tampered (Tp), and Ground-Truth Mask (Gt_mask) directories
-    case-insensitively inside `root`.
-    """
-    if not root.exists():
-        return None, None, None
-
-    subdirs = {d.name.lower(): d for d in root.iterdir() if d.is_dir()}
-
-    au_dir = None
-    for candidate in ("au", "authentic", "real", "pristine"):
-        if candidate in subdirs:
-            au_dir = subdirs[candidate]
-            break
-
-    tp_dir = None
-    for candidate in ("tp", "tampered", "forged", "fake", "spliced"):
-        if candidate in subdirs:
-            tp_dir = subdirs[candidate]
-            break
-
-    gt_dir = None
-    for candidate in ("gt_mask", "gt", "mask", "masks", "groundtruth", "ground_truth"):
-        if candidate in subdirs:
-            gt_dir = subdirs[candidate]
-            break
-
-    return au_dir, tp_dir, gt_dir
-
-
-class ForensicDataset(Dataset):
-    """
-    PyTorch Dataset for Image Forgery Detection & Localization using 2-Level Haar DWT MRA.
-    Each item returns:
-        - mra_tensor: FloatTensor of shape (C, 192, 192), where C = 9 (or 11 with MAD+ELA)
-        - cls_label: FloatTensor of shape (1,) in {0.0, 1.0}
-        - gt_mask: FloatTensor of shape (1, 192, 192) in {0.0, 1.0}
+    Dataset returning `(img_or_mra_tensor, mask_tensor, label_tensor)`.
+    Uses Hybrid Crop + Resize during training so the model excels at BOTH native-resolution
+    sliding window patches ('tile' mode) and full-image resizes ('fast' mode).
     """
 
     def __init__(
         self,
-        samples: List[Tuple[Path, Optional[Path], int]],
-        img_size: int = 192,
+        samples_or_root,
+        img_size: Tuple[int, int] = (192, 192),
+        is_train: bool = True,
+        return_mra: bool = False,
         use_forensic_maps: bool = False,
         ela_quality: int = 90,
-        is_train: bool = True,
+        native_crop_prob: float = 0.5,
     ) -> None:
         super().__init__()
-        self.samples = samples
-        self.img_size = img_size
+        if isinstance(samples_or_root, (str, Path)):
+            self.samples, self.stats = scan_casia_forensic_dir(str(samples_or_root))
+            print(
+                f"[DATASET] Tổng số ảnh Au: {self.stats['authentic']} | "
+                f"Ảnh Tp (có Mask): {self.stats['tampered']} | "
+                f"Bỏ qua Tp thiếu Mask: {self.stats['skipped_unmatched_tp']}"
+            )
+        else:
+            self.samples = samples_or_root
+            self.stats = {}
+
+        if isinstance(img_size, int):
+            self.img_size = (img_size, img_size)
+        else:
+            self.img_size = img_size
+
         self.is_train = is_train
-        self.mra = MRAPreprocessor(
-            target_size=(img_size, img_size),
-            use_forensic_maps=use_forensic_maps,
-            ela_quality=ela_quality,
+        self.native_crop_prob = native_crop_prob
+        self.return_mra = return_mra or use_forensic_maps
+        self.mra = (
+            MRAPreprocessor(
+                target_size=self.img_size,
+                use_forensic_maps=use_forensic_maps,
+                ela_quality=ela_quality,
+            )
+            if self.return_mra
+            else None
         )
 
     def __len__(self) -> int:
         return len(self.samples)
 
-    def _load_rgb(self, path: Path) -> np.ndarray:
-        with Image.open(path) as img:
-            return np.array(img.convert("RGB"), dtype=np.uint8)
+    def _extract_jpeg_aligned_crop(
+        self,
+        img_full: np.ndarray,
+        mask_full: np.ndarray,
+        target_h: int,
+        target_w: int,
+        label: float,
+    ) -> Tuple[np.ndarray, np.ndarray, float]:
+        """
+        Extracts a native-resolution (target_h x target_w) patch whose top-left coordinates
+        (y0, x0) are multiples of 8 (preserving the 8x8 JPEG block grid phase).
+        For Tampered (Tp) images, centers the crop around a forged pixel so the patch contains
+        actual tampered boundaries.
+        """
+        h, w = img_full.shape[:2]
+        max_y = h - target_h
+        max_x = w - target_w
 
-    def _load_mask(self, mask_path: Optional[Path], target_h: int, target_w: int) -> np.ndarray:
-        if mask_path is None or not mask_path.exists():
-            return np.zeros((target_h, target_w), dtype=np.float32)
-        with Image.open(mask_path) as m_img:
-            mask_gray = np.array(m_img.convert("L"), dtype=np.uint8)
-        if mask_gray.shape[0] != target_h or mask_gray.shape[1] != target_w:
-            if _HAS_CV2:
-                mask_gray = cv2.resize(
-                    mask_gray, (target_w, target_h), interpolation=cv2.INTER_NEAREST
-                )
-            else:
-                mask_gray = np.array(
-                    Image.fromarray(mask_gray).resize(
-                        (target_w, target_h), resample=Image.NEAREST
-                    ),
-                    dtype=np.uint8,
-                )
-        return (mask_gray > 127).astype(np.float32)
+        if label == 1.0:
+            fg_ys, fg_xs = np.where(mask_full > 0.5)
+            if len(fg_ys) > 0:
+                idx = random.randint(0, len(fg_ys) - 1)
+                cy, cx = int(fg_ys[idx]), int(fg_xs[idx])
+                jitter_y = random.randint(-target_h // 3, target_h // 3)
+                jitter_x = random.randint(-target_w // 3, target_w // 3)
+                y0 = max(0, min(max_y, cy - target_h // 2 + jitter_y))
+                x0 = max(0, min(max_x, cx - target_w // 2 + jitter_x))
+                # Snap to 8x8 JPEG block grid
+                y0 = min(max_y, (y0 // 8) * 8)
+                x0 = min(max_x, (x0 // 8) * 8)
+                crop_img = img_full[y0 : y0 + target_h, x0 : x0 + target_w]
+                crop_mask = mask_full[y0 : y0 + target_h, x0 : x0 + target_w]
+                eff_label = 1.0 if float(crop_mask.sum()) >= 16.0 else 0.0
+                return crop_img, crop_mask, eff_label
+
+        # Random 8x8-aligned crop for Authentic images
+        y_steps = max(0, max_y // 8)
+        x_steps = max(0, max_x // 8)
+        y0 = random.randint(0, y_steps) * 8
+        x0 = random.randint(0, x_steps) * 8
+        crop_img = img_full[y0 : y0 + target_h, x0 : x0 + target_w]
+        crop_mask = mask_full[y0 : y0 + target_h, x0 : x0 + target_w]
+        eff_label = 1.0 if float(crop_mask.sum()) >= 16.0 else 0.0
+        return crop_img, crop_mask, eff_label
 
     def _augment_joint(
-        self, rgb: np.ndarray, mask: np.ndarray
+        self, img_np: np.ndarray, mask_np: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Applies lightweight geometry-preserving augmentations that maintain 8x8 JPEG block
-        grid alignment (flips and 90-degree rotations) prior to MRA wavelet decomposition.
-        """
-        # Random horizontal flip
         if random.random() < 0.5:
-            rgb = np.ascontiguousarray(rgb[:, ::-1, :])
-            mask = np.ascontiguousarray(mask[:, ::-1])
+            img_np = np.ascontiguousarray(img_np[:, ::-1, :])
+            mask_np = np.ascontiguousarray(mask_np[:, ::-1])
 
-        # Random vertical flip
         if random.random() < 0.5:
-            rgb = np.ascontiguousarray(rgb[::-1, :, :])
-            mask = np.ascontiguousarray(mask[::-1, :])
+            img_np = np.ascontiguousarray(img_np[::-1, :, :])
+            mask_np = np.ascontiguousarray(mask_np[::-1, :])
 
-        # Random 90-degree rotation (k in {0, 1, 2, 3})
         k = random.randint(0, 3)
         if k > 0:
-            rgb = np.ascontiguousarray(np.rot90(rgb, k, axes=(0, 1)))
-            mask = np.ascontiguousarray(np.rot90(mask, k, axes=(0, 1)))
+            img_np = np.ascontiguousarray(np.rot90(img_np, k, axes=(0, 1)))
+            mask_np = np.ascontiguousarray(np.rot90(mask_np, k, axes=(0, 1)))
 
-        return rgb, mask
+        return img_np, mask_np
 
     def __getitem__(
-        self, index: int
+        self, idx: int
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        img_path, mask_path, label = self.samples[index]
+        s = self.samples[idx]
+        target_w, target_h = self.img_size[1], self.img_size[0]
+        label = float(s["label"])
 
-        rgb = self._load_rgb(img_path)
-        if rgb.shape[0] != self.img_size or rgb.shape[1] != self.img_size:
-            if _HAS_CV2:
-                rgb = cv2.resize(
-                    rgb, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR
+        with Image.open(s["img_path"]) as img_pil:
+            img_rgb = img_pil.convert("RGB")
+            orig_w, orig_h = img_rgb.size
+
+            use_native_crop = (
+                self.is_train
+                and orig_h >= target_h
+                and orig_w >= target_w
+                and random.random() < self.native_crop_prob
+            )
+
+            if use_native_crop:
+                img_full = np.array(img_rgb, dtype=np.uint8)
+                mask_full = np.zeros((orig_h, orig_w), dtype=np.float32)
+                if label == 1.0 and s["mask_path"]:
+                    try:
+                        with Image.open(s["mask_path"]) as mask_pil:
+                            mask_pil = mask_pil.convert("L")
+                            if mask_pil.size != (orig_w, orig_h):
+                                mask_pil = mask_pil.resize((orig_w, orig_h), Image.NEAREST)
+                            mask_full = (
+                                np.array(mask_pil, dtype=np.float32) / 255.0 > 0.5
+                            ).astype(np.float32)
+                    except Exception:
+                        pass
+                img_np, mask_np, label = self._extract_jpeg_aligned_crop(
+                    img_full, mask_full, target_h, target_w, label
                 )
             else:
-                rgb = np.array(
-                    Image.fromarray(rgb).resize(
-                        (self.img_size, self.img_size), resample=Image.BILINEAR
-                    ),
-                    dtype=np.uint8,
-                )
-
-        if label == 1 and mask_path is not None:
-            mask = self._load_mask(mask_path, self.img_size, self.img_size)
-        elif label == 1 and mask_path is None:
-            # Fallback if a tampered image has no pixel mask: weak center box supervision
-            mask = np.zeros((self.img_size, self.img_size), dtype=np.float32)
-        else:
-            mask = np.zeros((self.img_size, self.img_size), dtype=np.float32)
+                img_resized = img_rgb.resize((target_w, target_h), Image.BILINEAR)
+                img_np = np.array(img_resized, dtype=np.uint8)
+                mask_np = np.zeros((target_h, target_w), dtype=np.float32)
+                if label == 1.0 and s["mask_path"]:
+                    try:
+                        with Image.open(s["mask_path"]) as mask_pil:
+                            mask_pil = mask_pil.convert("L").resize(
+                                (target_w, target_h), Image.NEAREST
+                            )
+                            mask_raw = np.array(mask_pil, dtype=np.float32) / 255.0
+                            mask_np = (mask_raw > 0.5).astype(np.float32)
+                    except Exception:
+                        pass
 
         if self.is_train:
-            rgb, mask = self._augment_joint(rgb, mask)
+            img_np, mask_np = self._augment_joint(img_np, mask_np)
 
-        # Compute 9-channel (or 11-channel) MRA representation
-        mra_np = self.mra(rgb)  # (C, 192, 192)
+        if self.return_mra and self.mra is not None:
+            feat_np = self.mra(img_np)
+            img_tensor = torch.from_numpy(feat_np).float()
+        else:
+            img_tensor = (
+                torch.from_numpy(img_np).permute(2, 0, 1).float() / 255.0
+            )
 
-        mra_tensor = torch.from_numpy(mra_np).float()
-        cls_tensor = torch.tensor([float(label)], dtype=torch.float32)
-        mask_tensor = torch.from_numpy(mask).unsqueeze(0).float()  # (1, 192, 192)
-
-        return mra_tensor, cls_tensor, mask_tensor
-
-
-def collect_forensic_samples(data_dir: str) -> List[Tuple[Path, Optional[Path], int]]:
-    """
-    Scans `data_dir` for `Au/`, `Tp/`, and `Gt_mask/` folders and returns a list of
-    (image_path, mask_path_or_None, binary_label) tuples.
-    """
-    root = Path(data_dir)
-    au_dir, tp_dir, gt_dir = _resolve_dataset_folders(root)
-
-    samples: List[Tuple[Path, Optional[Path], int]] = []
-
-    # 1. Authentic images (label = 0)
-    if au_dir is not None:
-        for img_path in _list_images(au_dir):
-            samples.append((img_path, None, 0))
-
-    # 2. Tampered images (label = 1) matched with Ground-Truth masks
-    mask_lookup = _build_mask_lookup(gt_dir)
-    if tp_dir is not None:
-        for img_path in _list_images(tp_dir):
-            stem_lower = img_path.stem.lower()
-            matched_mask = mask_lookup.get(stem_lower, None)
-            samples.append((img_path, matched_mask, 1))
-
-    return samples
+        mask_tensor = torch.from_numpy(mask_np).unsqueeze(0).float()
+        label_tensor = torch.tensor([label], dtype=torch.float32)
+        return img_tensor, mask_tensor, label_tensor
 
 
 def build_dataloaders(
@@ -250,42 +306,46 @@ def build_dataloaders(
     train_split: float = 0.85,
     use_forensic_maps: bool = False,
     ela_quality: int = 90,
+    native_crop_prob: float = 0.5,
     seed: int = 42,
 ) -> Tuple[DataLoader, DataLoader, Dict[str, int]]:
-    """
-    Builds stratified Train and Validation DataLoaders from CASIA/Columbia/NIST16 folders.
-    """
-    samples = collect_forensic_samples(data_dir)
-    if len(samples) == 0:
-        raise FileNotFoundError(
-            f"No valid images found under '{data_dir}'. "
-            "Expected subdirectories: Au/, Tp/, and Gt_mask/."
-        )
+    samples, stats = scan_casia_forensic_dir(data_dir)
+
+    au_samples = [s for s in samples if s["label"] == 0.0]
+    tp_samples = [s for s in samples if s["label"] == 1.0]
 
     rng = random.Random(seed)
-    rng.shuffle(samples)
+    rng.shuffle(au_samples)
+    rng.shuffle(tp_samples)
 
-    n_total = len(samples)
-    n_train = max(1, int(n_total * train_split))
-    if n_total > 1 and n_train == n_total:
-        n_train = n_total - 1
+    n_au_train = int(len(au_samples) * train_split)
+    n_tp_train = int(len(tp_samples) * train_split)
 
-    train_samples = samples[:n_train]
-    val_samples = samples[n_train:] if n_total > 1 else samples
+    train_samples = au_samples[:n_au_train] + tp_samples[:n_tp_train]
+    val_samples = au_samples[n_au_train:] + tp_samples[n_tp_train:]
 
-    train_ds = ForensicDataset(
+    if len(val_samples) == 0:
+        val_samples = train_samples
+
+    rng.shuffle(train_samples)
+
+    train_ds = CASIADataset(
         train_samples,
-        img_size=img_size,
-        use_forensic_maps=use_forensic_maps,
-        ela_quality=ela_quality,
+        img_size=(img_size, img_size),
         is_train=True,
-    )
-    val_ds = ForensicDataset(
-        val_samples,
-        img_size=img_size,
+        return_mra=use_forensic_maps,
         use_forensic_maps=use_forensic_maps,
         ela_quality=ela_quality,
+        native_crop_prob=native_crop_prob,
+    )
+    val_ds = CASIADataset(
+        val_samples,
+        img_size=(img_size, img_size),
         is_train=False,
+        return_mra=use_forensic_maps,
+        use_forensic_maps=use_forensic_maps,
+        ela_quality=ela_quality,
+        native_crop_prob=0.0,
     )
 
     pin_mem = torch.cuda.is_available()
@@ -306,12 +366,6 @@ def build_dataloaders(
         drop_last=False,
     )
 
-    stats = {
-        "total": n_total,
-        "train": len(train_ds),
-        "val": len(val_ds),
-        "authentic": sum(1 for _, _, lbl in samples if lbl == 0),
-        "tampered": sum(1 for _, _, lbl in samples if lbl == 1),
-        "with_mask": sum(1 for _, m, lbl in samples if lbl == 1 and m is not None),
-    }
+    stats["train"] = len(train_ds)
+    stats["val"] = len(val_ds)
     return train_loader, val_loader, stats
