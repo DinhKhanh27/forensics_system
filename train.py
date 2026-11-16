@@ -19,7 +19,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import torch
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 try:
     from torch.amp import GradScaler as _AmpGradScaler
@@ -125,6 +125,24 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=3.0,
         help="Positive foreground pixel weight in BCE loss (default: 3.0)",
+    )
+    parser.add_argument(
+        "--focal_alpha",
+        type=float,
+        default=0.25,
+        help="Foreground alpha weight in Focal Loss (default: 0.25; increase e.g. 0.55 to boost tampered pixel recall)",
+    )
+    parser.add_argument(
+        "--warmup_epochs",
+        type=int,
+        default=0,
+        help="Linear LR warmup epochs at the start of each round before cosine decay (default: 0)",
+    )
+    parser.add_argument(
+        "--grad_clip",
+        type=float,
+        default=1.0,
+        help="Max gradient norm for clipping; 0 disables clipping (default: 1.0)",
     )
     parser.add_argument(
         "--native_crop_prob",
@@ -425,12 +443,28 @@ def main() -> None:
         criterion = MultiTaskForensicLoss(
             cls_weight=0.3,
             seg_weight=0.7,
+            focal_alpha=args.focal_alpha,
             pos_pixel_weight=args.pos_pixel_weight,
         )
         optimizer = AdamW(model.parameters(), lr=round_lr, weight_decay=1e-4)
-        scheduler = CosineAnnealingLR(
-            optimizer, T_max=args.epochs, eta_min=round_lr * 0.02
-        )
+        if args.warmup_epochs > 0 and args.epochs > args.warmup_epochs:
+            warmup_scheduler = LinearLR(
+                optimizer, start_factor=0.1, total_iters=args.warmup_epochs
+            )
+            cosine_scheduler = CosineAnnealingLR(
+                optimizer,
+                T_max=args.epochs - args.warmup_epochs,
+                eta_min=round_lr * 0.02,
+            )
+            scheduler = SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[args.warmup_epochs],
+            )
+        else:
+            scheduler = CosineAnnealingLR(
+                optimizer, T_max=args.epochs, eta_min=round_lr * 0.02
+            )
         scaler = create_grad_scaler(device.type, enabled=amp_enabled)
 
         if is_resuming_round and resumed_ckpt is not None:
@@ -471,6 +505,9 @@ def main() -> None:
                     total_loss, _ = criterion(logits_cls, logits_mask, labels, masks)
 
                 scaler.scale(total_loss).backward()
+                if args.grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
                 train_loss_sum += float(total_loss.item())
