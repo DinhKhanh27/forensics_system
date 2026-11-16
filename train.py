@@ -56,6 +56,21 @@ def set_seed(seed: int = 42) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _atomic_torch_save(payload: Dict, target_path: str) -> None:
+    """Save checkpoint atomically via a temporary file to prevent corruption on disconnect."""
+    tmp_path = f"{target_path}.tmp"
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, target_path)
+
+
+def _atomic_json_save(data: List[Dict], target_path: str) -> None:
+    """Save training history JSON atomically."""
+    tmp_path = f"{target_path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp_path, target_path)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train DWT-MobileUNet (Multi-Round Supported) on Google Colab CUDA GPU"
@@ -132,6 +147,11 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Explicit checkpoint path to load before starting the round",
+    )
+    parser.add_argument(
+        "--auto_resume",
+        action="store_true",
+        help="Automatically resume an interrupted round from last_model.pth (restoring optimizer, scheduler, scaler, and epoch)",
     )
     parser.add_argument(
         "--from-scratch",
@@ -298,18 +318,22 @@ def main() -> None:
 
     best_score = 0.0
     history: List[Dict] = []
-    if os.path.exists(history_path) and not args.from_scratch:
+    if os.path.exists(history_path) and (not args.from_scratch or args.auto_resume):
         try:
             with open(history_path, "r", encoding="utf-8") as f:
                 history = json.load(f)
         except Exception:
             history = []
 
-    ckpt_to_load: Optional[str] = (
-        args.resume
-        if args.resume
-        else (best_model_path if not args.from_scratch else None)
-    )
+    resumed_ckpt: Optional[Dict] = None
+    ckpt_to_load: Optional[str] = None
+    if args.resume:
+        ckpt_to_load = args.resume
+    elif args.auto_resume and os.path.exists(last_model_path):
+        ckpt_to_load = last_model_path
+    elif not args.from_scratch:
+        ckpt_to_load = best_model_path
+
     if ckpt_to_load and os.path.exists(ckpt_to_load):
         print(f"🔄 Phát hiện checkpoint tại: {ckpt_to_load}. Đang kiểm tra tương thích...")
         try:
@@ -325,15 +349,17 @@ def main() -> None:
                 model.load_state_dict(sd, strict=True)
                 if isinstance(raw_ckpt, dict):
                     best_score = float(raw_ckpt.get("best_score", 0.0))
+                    resumed_ckpt = raw_ckpt
                 print(
                     f"✅ Nạp trọng số DWTMobileUNet thành công (Global best_score={best_score:.4f})!"
                 )
         except Exception as e:
             print(
-                f"ℹ️ Checkpoint cũ thuộc kiến trúc trước ({type(e).__name__}). "
+                f"ℹ️ Checkpoint cũ thuộc kiến trúc trước hoặc bị lỗi ({type(e).__name__}). "
                 f"Khởi tạo huấn luyện mới với kiến trúc chuẩn DWTMobileUNet (best_score=0.0)."
             )
             best_score = 0.0
+            resumed_ckpt = None
 
     # 4. Execute Training across 1 or multiple rounds
     start_round = args.round_id
@@ -343,7 +369,41 @@ def main() -> None:
         current_round = start_round + r_offset
         round_lr = args.lr * (args.round_lr_decay ** r_offset)
 
-        if r_offset > 0 and os.path.exists(best_model_path):
+        start_epoch = 1
+        round_best_score = -1.0
+        is_resuming_round = False
+
+        if resumed_ckpt is not None and (args.resume or args.auto_resume):
+            ckpt_round = int(resumed_ckpt.get("round_id", -1))
+            ckpt_epoch = int(resumed_ckpt.get("epoch", 0))
+            if args.auto_resume and not args.resume:
+                if ckpt_round > current_round:
+                    print(
+                        f"⏭️ [ROUND {current_round}] Phát hiện last_model.pth đang ở Round {ckpt_round}. "
+                        f"Bỏ qua Round {current_round} để tránh ghi đè tiến trình mới hơn."
+                    )
+                    continue
+                if ckpt_round == current_round and ckpt_epoch >= args.epochs:
+                    print(
+                        f"✅ [ROUND {current_round}] Đã hoàn tất trước đó ({ckpt_epoch}/{args.epochs} epochs). Bỏ qua!"
+                    )
+                    continue
+            if ckpt_round == current_round and ckpt_epoch < args.epochs:
+                start_epoch = ckpt_epoch + 1
+                round_best_score = float(resumed_ckpt.get("round_best_score", -1.0))
+                is_resuming_round = True
+            elif ckpt_round < current_round and r_offset == 0 and os.path.exists(best_model_path):
+                # Previous round finished; start the new round from best_model.pth
+                best_ckpt = torch.load(best_model_path, map_location=device)
+                if not best_ckpt.get("dry_run", False):
+                    model.load_state_dict(best_ckpt["model_state_dict"], strict=True)
+                    best_score = float(best_ckpt.get("best_score", best_score))
+                    print(
+                        f"\n🔄 [ROUND {current_round}] Đã nạp best_model.pth từ Round {ckpt_round} "
+                        f"(Best Score = {best_score:.4f}) để tinh chỉnh tiếp với LR = {round_lr:.6f}"
+                    )
+
+        if r_offset > 0 and not is_resuming_round and os.path.exists(best_model_path):
             best_ckpt = torch.load(best_model_path, map_location=device)
             model.load_state_dict(best_ckpt["model_state_dict"], strict=True)
             print(
@@ -352,9 +412,14 @@ def main() -> None:
             )
 
         print("=" * 72)
-        print(
-            f"🚀 BẮT ĐẦU ROUND {current_round} | Epochs: {args.epochs} | LR: {round_lr:.6f} | Batch: {args.batch_size}"
-        )
+        if is_resuming_round:
+            print(
+                f"🔄 RESUME ROUND {current_round} từ Epoch {start_epoch}/{args.epochs} | LR: {round_lr:.6f} | Batch: {args.batch_size}"
+            )
+        else:
+            print(
+                f"🚀 BẮT ĐẦU ROUND {current_round} | Epochs: {args.epochs} | LR: {round_lr:.6f} | Batch: {args.batch_size}"
+            )
         print("=" * 72)
 
         criterion = MultiTaskForensicLoss(
@@ -368,12 +433,29 @@ def main() -> None:
         )
         scaler = create_grad_scaler(device.type, enabled=amp_enabled)
 
-        round_best_score = -1.0
+        if is_resuming_round and resumed_ckpt is not None:
+            if "optimizer_state_dict" in resumed_ckpt:
+                optimizer.load_state_dict(resumed_ckpt["optimizer_state_dict"])
+            if "scheduler_state_dict" in resumed_ckpt:
+                scheduler.load_state_dict(resumed_ckpt["scheduler_state_dict"])
+            if "scaler_state_dict" in resumed_ckpt and amp_enabled:
+                scaler.load_state_dict(resumed_ckpt["scaler_state_dict"])
+            history = [
+                h
+                for h in history
+                if not (
+                    h.get("round_id") == current_round
+                    and int(h.get("epoch", 0)) >= start_epoch
+                )
+            ]
+            # Clear resumed_ckpt after consuming it for this round
+            resumed_ckpt = None
+
         round_best_path = os.path.join(
             args.save_dir, f"round_{current_round}_best.pth"
         )
 
-        for epoch in range(1, args.epochs + 1):
+        for epoch in range(start_epoch, args.epochs + 1):
             t_ep = time.perf_counter()
             model.train()
             train_loss_sum = 0.0
@@ -459,6 +541,10 @@ def main() -> None:
                 f"Au-FP: {avg_au_fp*100:.2f}%"
             )
 
+            if composite_score > round_best_score:
+                round_best_score = composite_score
+            new_global_best = max(best_score, composite_score)
+
             ckpt_payload = {
                 "round_id": current_round,
                 "epoch": epoch,
@@ -466,23 +552,26 @@ def main() -> None:
                 "arch": "DWTMobileUNet",
                 "in_channels": in_channels,
                 "width_multiplier": 0.5,
-                "best_score": max(best_score, composite_score),
+                "best_score": new_global_best,
+                "round_best_score": round_best_score,
                 "val_acc": val_acc,
                 "val_pixel_f1": avg_pixel_f1,
                 "val_iou": avg_pixel_iou,
                 "au_fp_rate": avg_au_fp,
                 "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
             }
-            torch.save(ckpt_payload, last_model_path)
+            _atomic_torch_save(ckpt_payload, last_model_path)
 
-            if composite_score > round_best_score:
-                round_best_score = composite_score
-                torch.save(ckpt_payload, round_best_path)
+            if composite_score >= round_best_score:
+                _atomic_torch_save(ckpt_payload, round_best_path)
 
             if composite_score > best_score:
                 best_score = composite_score
                 ckpt_payload["best_score"] = best_score
-                torch.save(ckpt_payload, best_model_path)
+                _atomic_torch_save(ckpt_payload, best_model_path)
                 print(
                     f"  --> [Saved New Global Best Model] Composite Score: {best_score:.4f} (Pixel-F1: {avg_pixel_f1:.4f}, Au-FP: {avg_au_fp*100:.2f}%)"
                 )
@@ -500,8 +589,7 @@ def main() -> None:
                     "composite_score": composite_score,
                 }
             )
-            with open(history_path, "w", encoding="utf-8") as f:
-                json.dump(history, f, indent=2)
+            _atomic_json_save(history, history_path)
 
         run_real_sanity_check(model, val_loader, device)
         print(
